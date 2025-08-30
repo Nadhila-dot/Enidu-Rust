@@ -1,0 +1,51 @@
+name: Rust Cross-Compile
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - x86_64-pc-windows-gnu
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      # Setup Rust toolchain
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+
+      # Install dependencies for cross compilation
+      - name: Install cross-compilers and libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libssl-dev \
+            gcc-mingw-w64 \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            musl-tools
+
+      # Build the project
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # Upload the compiled binaries
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/
