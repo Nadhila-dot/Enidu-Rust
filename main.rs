@@ -9,9 +9,14 @@ mod libs;
 mod connect;
 pub mod types;
 mod scale;
+use rustls::crypto::CryptoProvider;
 
 fn main() {
     let (num_threads, http_threads) = configure_threads();
+
+    rustls::crypto::ring::default_provider()
+    .install_default()
+    .unwrap();
 
     print(&format!("[SERVER] Tokio starting (WEBSERVER) with worker {} threads", num_threads), false);
     print(&format!("[SERVER] Tokio starting (HTTP) with worker {} threads", http_threads), false);

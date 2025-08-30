@@ -1,0 +1,798 @@
+use futures::future;
+use rand::{Rng};
+use reqwest::{ClientBuilder, Proxy, RequestBuilder, StatusCode};
+use serde::{Deserialize, Serialize};
+use std::fs::File;
+use std::io::Write;
+use std::path::Path;
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::broadcast;
+use tokio::sync::mpsc;
+use tokio::time::sleep;
+use std::alloc::GlobalAlloc;
+//@rs-ignore
+use rand::thread_rng;
+
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+
+use crate::connect::json::daemon_json;
+use crate::libs::logs::print;
+use crate::types::{AppState, JobInfo, JobStatus};
+use crate::env::container::get_system_stats;
+
+// Shutdown phases for controlled resource reduction
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownPhase {
+    Running,
+    ShuttingDown,
+    Draining,
+    Stopped,
+}
+
+// Statistics structure to track results
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TestStats {
+    pub sent: i64,
+    pub success: i64,
+    pub errors: i64,
+    pub timeouts: i64,
+    pub conn_errors: i64,
+}
+
+// System resource info for auto-scaling
+#[derive(Debug, Clone)]
+struct SystemResources {
+    cpu_usage: f32,
+    memory_available: u64,
+    total_memory: u64,
+}
+
+// Full user agents list for better randomization (kept from original)
+static USER_AGENTS: &[&str] = &[
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/117.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36 Edg/115.0.1901.203",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like creepercloud.io) Version/16.6 Mobile/15E148 Safari/604.1",
+];
+
+// Random referer URLs (kept from original)
+static REFERERS: &[&str] = &[
+    "https://www.google.com/",
+    "https://www.facebook.com/",
+    "https://www.twitter.com/",
+    "https://www.instagram.com/",
+    "https://www.reddit.com/",
+    "https://www.linkedin.com/",
+    "https://www.youtube.com/",
+    "https://www.amazon.com/",
+    "https://www.netflix.com/",
+
+];
+
+// Random accept language headers (kept from original)
+static ACCEPT_LANGUAGES: &[&str] = &[
+    "en-US,en;q=0.9",
+    "en-GB,en;q=0.9",
+    "en-CA,en;q=0.9",
+    "en-AU,en;q=0.9",
+    "fr-FR,fr;q=0.9,en;q=0.8",
+    "es-ES,es;q=0.9,en;q=0.8",
+    "de-DE,de;q=0.9,en;q=0.8",
+    "ja-JP,ja;q=0.9,en;q=0.8",
+    "zh-CN,zh;q=0.9,en;q=0.8",
+];
+
+// Global atomic counters for stats tracking
+struct AtomicStats {
+    sent: AtomicI64,
+    success: AtomicI64,
+    errors: AtomicI64,
+    timeouts: AtomicI64,
+    conn_errors: AtomicI64,
+}
+
+impl AtomicStats {
+    fn new() -> Self {
+        Self {
+            sent: AtomicI64::new(0),
+            success: AtomicI64::new(0),
+            errors: AtomicI64::new(0),
+            timeouts: AtomicI64::new(0),
+            conn_errors: AtomicI64::new(0),
+        }
+    }
+
+    fn to_test_stats(&self) -> TestStats {
+        TestStats {
+            sent: self.sent.load(Ordering::Relaxed),
+            success: self.success.load(Ordering::Relaxed),
+            errors: self.errors.load(Ordering::Relaxed),
+            timeouts: self.timeouts.load(Ordering::Relaxed),
+            conn_errors: self.conn_errors.load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn create_stop_file_watcher() -> mpsc::Receiver<()> {
+    let (tx, rx) = mpsc::channel(1);
+    
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(5)); // Keep original fast polling
+        loop {
+            interval.tick().await;
+            if Path::new(".stop-runner").exists() {
+                let _ = tx.send(()).await;
+                break;
+            }
+        }
+    });
+    
+    rx
+}
+
+// Monitor system resources for auto-scaling (kept from original)
+fn monitor_system_resources() -> SystemResources {
+    let sys = get_system_stats();
+    let mem_available = sys.total_memory() - sys.used_memory();
+    let cpu_usage = 1.0 - (mem_available as f32 / sys.total_memory() as f32);
+    
+    SystemResources {
+        cpu_usage,
+        memory_available: mem_available,
+        total_memory: sys.total_memory(),
+    }
+}
+
+// Read max workers from .env file
+fn get_max_workers_from_env() -> Option<u32> {
+    if let Ok(env_content) = std::fs::read_to_string(".env") {
+        for line in env_content.lines() {
+            if let Some(value) = line.strip_prefix("MAX_WORKERS=") {
+                return value.trim().parse().ok();
+            }
+        }
+    }
+    None
+}
+
+// Dynamic concurrency adjustment based on system resources (enhanced from original)
+fn adjust_concurrency(
+    semaphore: &tokio::sync::Semaphore, 
+    resources: &SystemResources,
+    target_concurrency: u32,
+    current_rps: u32,
+    target_rps: u32
+) {
+    let current_permits = semaphore.available_permits();
+    
+    // More aggressive memory factor
+    let memory_factor = if resources.memory_available < (resources.total_memory / 10) {
+        2.0
+    } else if resources.memory_available < (resources.total_memory / 5) {
+        0.6
+    } else {
+        1.2 // Actually increase when memory is good
+    };
+    
+    // RPS-based adjustment
+    let rps_factor = if current_rps < target_rps / 2 {
+        1.5 // Boost when RPS is too low
+    } else if current_rps > target_rps {
+        0.9 // Slight reduction when target exceeded
+    } else {
+        1.1 // Slight increase otherwise
+    };
+    
+    let target_permits = (target_concurrency as f32 * memory_factor * rps_factor) as usize;
+    let target_permits = std::cmp::min(target_permits, 50_000_000); // Massive cap
+    
+    let diff = target_permits as isize - current_permits as isize;
+    if diff > 0 {
+        semaphore.add_permits(diff as usize);
+    }
+}
+
+// ULTRA-POWERFUL main http tester with consistent high RPS
+pub async fn http_tester(
+    target_url: String,
+    proxy_addr: Option<String>,
+    concurrency: u32,
+    timeout_sec: u64,
+    wait_ms: u32,
+    random_headers: bool,
+    log_tx: broadcast::Sender<String>,
+    mut stop_rx: broadcast::Receiver<String>,
+) -> TestStats {
+    // Send initial message
+    let _ = log_tx.send(daemon_json("update", &format!("MAXIMUM POWER MODE: Launching Job for {}", target_url)));
+    let _ = log_tx.send(daemon_json("update", &format!("Using base concurrency: {}", concurrency)));
+
+    // Create atomic stats counters
+    let stats = Arc::new(AtomicStats::new());
+
+    // Track shutdown state (kept from original)
+    let shutdown_phase = Arc::new(AtomicU32::new(ShutdownPhase::Running as u32));
+    let stop_flag = Arc::new(tokio::sync::Notify::new());
+    let is_stopping = Arc::new(AtomicBool::new(false));
+
+    // Get MAX_WORKERS from .env or calculate massive default
+    let max_workers_from_env = get_max_workers_from_env();
+    let _ = log_tx.send(daemon_json("update", &format!("MAX_WORKERS from .env: {:?}", max_workers_from_env)));
+
+    // Ultra-aggressive semaphore - use env value or massive calculated value
+    let max_concurrent_requests = std::cmp::min(concurrency * 1_000_000, 1_000_000_000);  // Increased cap to 1B
+    
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_requests as usize));
+
+    
+    let mut client_builder = ClientBuilder::new()
+        .timeout(Duration::from_millis(100))  // Reduced from timeout_sec for faster cycles
+        .pool_max_idle_per_host(10_000_000)  // Increased pool
+        .pool_idle_timeout(Duration::from_secs(60))  // Extended
+        .connect_timeout(Duration::from_millis(50))  // Faster connects
+        .danger_accept_invalid_certs(true)
+        .tcp_nodelay(true)
+        .tcp_keepalive(Some(Duration::from_secs(60)))
+        .http1_only()  // Force HTTP/1.1 for raw speed
+        .no_gzip();  // Disable compression
+
+    // Add proxy if specified (kept from original)
+    if let Some(proxy_url) = proxy_addr {
+        if let Ok(proxy) = Proxy::all(&proxy_url) {
+            client_builder = client_builder.proxy(proxy);
+            let _ = log_tx.send(daemon_json("info", &format!("Using proxy: {}", proxy_url)));
+        } else {
+            let _ = log_tx.send(daemon_json("error", &format!("Failed to configure proxy: {}", proxy_url)));
+        }
+    }
+
+    let client = match client_builder.build() {
+        Ok(client) => Arc::new(client),
+        Err(e) => {
+            let _ = log_tx.send(daemon_json("error", &format!("Error building HTTP client: {}", e)));
+            return TestStats::default();
+        }
+    };
+
+    // Create ultra-fast stop file watcher (kept from original)
+    let mut stop_file_watcher = create_stop_file_watcher();
+
+    // Setup enhanced resource monitoring for auto-scaling
+    let target_concurrency = Arc::new(AtomicU32::new(max_concurrent_requests));
+    let current_rps = Arc::new(AtomicU32::new(0));
+    let semaphore_clone = semaphore.clone();
+    let target_concurrency_clone = target_concurrency.clone();
+    let current_rps_clone = current_rps.clone();
+    
+    // Enhanced resource monitoring task
+    let resource_monitor_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(100)); // Much faster monitoring
+        loop {
+            interval.tick().await;
+            
+            let resources = monitor_system_resources();
+            let rps = current_rps_clone.load(Ordering::Relaxed);
+            let target_rps = 10_000_000; 
+            
+            adjust_concurrency(
+                &semaphore_clone, 
+                &resources,
+                target_concurrency_clone.load(Ordering::Relaxed),
+                rps,
+                target_rps
+            );
+        }
+    });
+
+    // Clone stop_rx for workers before moving to monitor
+    let stop_rx_workers = stop_rx.resubscribe();
+
+   
+    let shutdown_phase_clone = shutdown_phase.clone();
+    let log_tx_clone = log_tx.clone();
+    let is_stopping_clone = is_stopping.clone();
+    let stop_flag_clone = stop_flag.clone();
+
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = stop_rx.recv() => {
+                let _ = log_tx_clone.send(daemon_json("action", "Stopping server.... initiating Shutdown..."));
+                is_stopping_clone.store(true, Ordering::SeqCst);
+                shutdown_phase_clone.store(ShutdownPhase::ShuttingDown as u32, Ordering::SeqCst);
+                stop_flag_clone.notify_waiters();
+            }
+            _ = stop_file_watcher.recv() => {
+                let _ = log_tx_clone.send(daemon_json("action", "Stopping server.... initiating Shutdown..."));
+                is_stopping_clone.store(true, Ordering::SeqCst);
+                shutdown_phase_clone.store(ShutdownPhase::ShuttingDown as u32, Ordering::SeqCst);
+                stop_flag_clone.notify_waiters();
+            }
+        }
+    });
+
+    // Enhanced stats printer task with RPS tracking
+    let stats_clone = stats.clone();
+    let shutdown_phase_clone = shutdown_phase.clone();
+    let log_tx_clone = log_tx.clone();
+    let is_stopping_clone = is_stopping.clone();
+    let current_rps_clone = current_rps.clone();
+    
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(1000)); // Keep 1s from original
+        let start_time = std::time::Instant::now();
+        let mut last_sent = 0;
+        let mut last_success = 0;
+        
+        loop {
+            interval.tick().await;
+            
+            if is_stopping_clone.load(Ordering::Relaxed) {
+                break;
+            }
+            
+            let current_stats = stats_clone.to_test_stats();
+            let elapsed = start_time.elapsed().as_secs_f64();
+            
+            let sent_diff = current_stats.sent - last_sent;
+            let success_diff = current_stats.success - last_success;
+            
+            // Update current RPS for resource monitoring
+            current_rps_clone.store(sent_diff as u32, Ordering::Relaxed);
+            
+            let stats_json = serde_json::json!({
+                "event": "update",
+                "time": elapsed,
+                "sent": current_stats.sent,
+                "sent_per_sec": sent_diff,
+                "success": current_stats.success,
+                "success_per_sec": success_diff,
+                "errors": current_stats.errors,
+                "timeouts": current_stats.timeouts,
+                "conn_errors": current_stats.conn_errors
+            });
+            let _ = log_tx_clone.send(stats_json.to_string());
+            
+            last_sent = current_stats.sent;
+            last_success = current_stats.success;
+        }
+    });
+
+    // Calculate workers with ultra-aggressive scaling (enhanced from original)
+    let num_cpus = num_cpus::get() as u32;
+    let resources = monitor_system_resources();
+    let memory_gb = resources.total_memory / (1024 * 1024 * 1024);
+
+    // Use env variable if set, otherwise calculate maximum possible
+    let total_workers = if let Some(env_workers) = max_workers_from_env {
+        env_workers
+    } else {
+        
+        let workers_per_cpu = if memory_gb > 32 {
+            10_000_000  
+        } else if memory_gb > 16 {
+            10_000_000  
+        } else if memory_gb > 8 {
+            9_000_000  
+        } else if memory_gb > 4 {
+            2_000_000    
+        } else {
+            1_000_000    
+        };
+
+       
+        let target_rps = 1_000_000; // Target 1M RPS
+        let estimated_latency_ms = timeout_sec * 2; // Assume latency up to double timeout
+        let workers_for_rps = (target_rps * estimated_latency_ms / 1000) as u32;
+
+       
+        let memory_kb_per_worker = 500; 
+        let max_memory_workers = ((resources.memory_available / 1024) / memory_kb_per_worker) as u32;
+
+        // Calculate final worker count
+        let calculated_workers = num_cpus * workers_per_cpu;
+        let rps_workers = std::cmp::max(workers_for_rps, calculated_workers);
+        let system_max = std::cmp::min(max_memory_workers, 200_000_000); // Allow up to 200M workers
+        std::cmp::min(rps_workers, system_max)
+    };
+
+    // Log ultra-aggressive configuration
+    let _ = log_tx.send(daemon_json("update", &format!(
+        "MAXIMUM POWER MODE: Target RPS: 10K+, Worker count: {}, CPUs: {}",
+        total_workers, num_cpus
+    )));
+    
+    let inner_json = serde_json::json!({
+        "event": "launch_workers",
+        "workers": total_workers,
+        "cpus": num_cpus,
+        "target_url": target_url,
+        "max_concurrent": max_concurrent_requests,
+        "optimization": "ultra_aggressive_consistent"
+    }).to_string();
+
+    let quic_msg = daemon_json("update", &inner_json);
+    let _ = log_tx.send(quic_msg);
+    let _ = log_tx.send(daemon_json("update", &format!(
+        "[MAXIMUM-POWER-SYS]: {}GB RAM | {} CPUs | {} workers | {} max concurrent",
+        memory_gb, num_cpus, total_workers, max_concurrent_requests
+    )));
+
+    // Start workers with enhanced semaphore control
+    let mut handles = Vec::with_capacity(std::cmp::min(total_workers as usize, 10_000_000)); // Cap vector size
+
+    for worker_id in 0..total_workers {
+        let client = client.clone();
+        let target_url = target_url.clone();
+        let stats = stats.clone();
+        let shutdown_phase = shutdown_phase.clone();
+        let is_stopping = is_stopping.clone();
+        let stop_flag = stop_flag.clone();
+        let log_tx = log_tx.clone();
+        let mut stop_rx = stop_rx_workers.resubscribe();
+        let semaphore = semaphore.clone();
+
+        let handle = tokio::spawn(async move {
+            // Initialize worker-local RNG (kept from original)
+            let mut rng = StdRng::from_rng(&mut thread_rng());
+
+            loop {
+                // Ultra-responsive termination check
+                if is_stopping.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                // Phase check for immediate exit
+                let phase = shutdown_phase.load(Ordering::Relaxed);
+                if phase >= ShutdownPhase::Draining as u32 {
+                    break;
+                }
+
+                // Enhanced permit acquisition with backoff
+                let permit = semaphore.acquire().await;  // Use await instead of try_acquire
+
+                // Create request
+                let mut req = client.get(&target_url);
+
+                // Apply random headers if enabled (kept from original logic)
+                if random_headers && phase == ShutdownPhase::Running as u32 {
+                    req = apply_random_headers(req, &mut rng);
+                }
+
+                // Send request and increment counter
+                stats.sent.fetch_add(1, Ordering::Relaxed);
+                
+               
+                let process_response = |result: Result<reqwest::Response, reqwest::Error>| {
+                    match result {
+                        Ok(mut resp) => {
+                            // Drain body asynchronously to avoid blocking the async runtime
+                            let _ = tokio::spawn(async move {
+                                let _ = resp.bytes().await;
+                            });
+                            // Accurate success check
+                            if resp.status().is_success() {
+                                stats.success.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                stats.errors.fetch_add(1, Ordering::Relaxed);
+                            }
+                        },
+                        Err(e) => {
+                            if e.is_timeout() {
+                                stats.timeouts.fetch_add(1, Ordering::Relaxed);
+                            } else if is_connection_error(&e) {
+                                stats.conn_errors.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                stats.errors.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                };
+
+
+                // Super-responsive cancellation with tokio::select! (kept from original)
+                tokio::select! {
+                    _ = stop_rx.recv() => {
+                        drop(permit);
+                        break;
+                    }
+                    _ = stop_flag.notified() => {
+                        drop(permit);
+                        break;
+                    }
+                    result = req.send() => {
+                        process_response(result);
+                        drop(permit);
+                    }
+                }
+
+                // Minimal wait with jitter (kept from original but optimized)
+                if wait_ms > 0 && phase == ShutdownPhase::Running as u32 {
+                    let jitter = (wait_ms as f64 * 0.1) as u32; // Reduced jitter
+                    let adjusted_wait = if jitter > 0 {
+                        wait_ms + rng.random_range(0..jitter) - jitter / 2
+                    } else {
+                        wait_ms
+                    };
+                    
+                    if adjusted_wait > 0 {
+                        tokio::select! {
+                            _ = sleep(Duration::from_millis(adjusted_wait as u64)) => {}
+                            _ = stop_rx.recv() => break,
+                            _ = stop_flag.notified() => break,
+                        }
+                    }
+                }
+            }
+        });
+
+        handles.push(handle);
+    }
+
+    // Wait for shutdown signal
+    let _ = stop_flag.notified().await;
+    
+    // When shutdown is triggered, enter draining phase (kept from original)
+    shutdown_phase.store(ShutdownPhase::Draining as u32, Ordering::SeqCst);
+    is_stopping.store(true, Ordering::SeqCst);
+    
+    // Notify all workers
+    print("[DAEMON] MAXIMUM POWER: Received signal to notify all workers to stop...", true);
+    for _ in 0..10 {
+        stop_flag.notify_waiters();
+    }
+    
+    // Cancel resource monitor
+    print("[DAEMON] Received signal to stop resource monitor...", true);
+    resource_monitor_handle.abort();
+    
+    // Wait for workers to complete with short timeout
+    let max_wait = Duration::from_secs(2);
+    let _ = tokio::time::timeout(max_wait, future::join_all(handles)).await;
+
+    // Final cleanup
+    print("MAXIMUM POWER: Received signal to perform final cleanup...", true);
+    shutdown_phase.store(ShutdownPhase::Stopped as u32, Ordering::SeqCst);
+
+    // Force aggressive resource cleanup (kept from original)
+    drop(client);
+    let _ = log_tx.send(daemon_json("update", "Performing aggressive memory cleanup..."));
+    force_cleanup();
+
+    // Get final stats
+    let final_stats = stats.to_test_stats();
+
+    let final_stats_json = serde_json::json!({
+        "event": "http_tester_stopped",
+        "sent": final_stats.sent,
+        "success": final_stats.success,
+        "errors": final_stats.errors,
+        "timeouts": final_stats.timeouts,
+        "conn_errors": final_stats.conn_errors
+    });
+    let _ = log_tx.send(final_stats_json.to_string());
+
+    final_stats
+}
+
+// Add this helper function for forced cleanup (kept from original)
+fn force_cleanup() {
+    print("Forcing cleanup...", true);
+    unsafe {
+        std::alloc::System.alloc_zeroed(std::alloc::Layout::new::<u8>());
+    }
+}
+
+// Apply random headers to a request (kept full implementation from original)
+fn apply_random_headers(
+    req: RequestBuilder,
+    rng: &mut impl Rng
+) -> RequestBuilder {
+    let mut req = req.header("User-Agent", USER_AGENTS[rng.gen_range(0..USER_AGENTS.len())]);
+
+    let cache_values = ["no-cache", "max-age=0", "no-store", "must-revalidate"];
+    req = req.header("Cache-Control", cache_values[rng.gen_range(0..cache_values.len())]);
+
+    if rng.gen_ratio(8, 10) {
+        req = req.header("Referer", REFERERS[rng.gen_range(0..REFERERS.len())]);
+    }
+
+    req = req.header("Accept-Language", ACCEPT_LANGUAGES[rng.gen_range(0..ACCEPT_LANGUAGES.len())]);
+
+    if rng.gen_ratio(5, 10) {
+        req = req.header("Sec-CH-UA", "\"Google Chrome\";v=\"115\", \"Chromium\";v=\"115\", \"Not:A-Brand\";v=\"99\"");
+        req = req.header("Sec-CH-UA-Mobile", "?0");
+        req = req.header("Sec-CH-UA-Platform", "\"Windows\"");
+    }
+
+    if rng.gen_ratio(3, 10) {
+        req = req.header(
+            format!("X-Custom-{}", rng.gen_range(0..999)),
+            format!("value-{}", rng.gen_range(0..99999))
+        );
+    }
+
+    req
+}
+
+// Improved stop_job with instant termination (kept from original)
+pub fn stop_job(app_state: &AppState, id: &str) -> bool {
+    let mut jobs = app_state.jobs.lock().unwrap();
+
+    if let Some(job) = jobs.get_mut(id) {
+        job.status = JobStatus::Stopping;
+
+        // FIRST: Create stop files immediately
+        create_stop_files();
+
+        // SECOND: Log instant termination
+        let log_channels = app_state.log_channels.lock().unwrap();
+        if let Some(log_tx) = log_channels.get(id) {
+            let _ = log_tx.send(daemon_json("update", "Forcibly terminating all workers"));
+        }
+        drop(log_channels);
+
+        // THIRD: Broadcast stop signal to all channels
+        print(&format!("Forcibly terminating all workers for job {}", id), true);
+        {
+            let stop_channels = app_state.stop_channels.lock().unwrap();
+            if let Some(stop_tx) = stop_channels.get(id) {
+                // Send multiple stop signals to ensure delivery
+                for _ in 0..5 {
+                    let _ = stop_tx.send("STOP_IMMEDIATELY".to_string());
+                }
+            }
+        }
+
+        // FOURTH: Abort the task immediately
+        print(&format!("Forcibly terminating all workers for job {}", id), true);
+        {
+            let mut job_tasks = app_state.job_tasks.lock().unwrap();
+            if let Some(handle) = job_tasks.remove(id) {
+                handle.abort();
+            }
+        }
+
+        true
+    } else {
+        false
+    }
+}
+
+// Check if an error is connection-related (kept from original)
+fn is_connection_error(err: &reqwest::Error) -> bool {
+    let err_str = err.to_string();
+    err_str.contains("connection") ||
+        err_str.contains("reset") ||
+        err_str.contains("broken pipe") ||
+        err_str.contains("EOF") ||
+        err_str.contains("i/o timeout")
+}
+
+// Create stop files to signal shutdown (kept from original)
+pub fn create_stop_files() {
+    let stop_files = &[
+        ".stop-runner",
+        ".stop",
+        "data/.stop",
+    ];
+
+    for &path in stop_files {
+        if let Ok(mut file) = File::create(path) {
+            let _ = file.write_all(b"stop");
+        }
+    }
+
+    // Try temp directory
+    if let Some(tmp_dir) = std::env::temp_dir().to_str() {
+        let tmp_path = format!("{}/enidu.stop", tmp_dir);
+        if let Ok(mut file) = File::create(tmp_path) {
+            let _ = file.write_all(b"stop");
+        }
+    }
+}
+
+// Remove all stop files
+// Remove lock files
+pub fn remove_stop_files() {
+    let stop_files = &[
+        ".stop-runner",
+        ".stop",
+        "data/.stop",
+    ];
+
+    for &path in stop_files {
+        let _ = std::fs::remove_file(path);
+    }
+
+    // Try temp directory
+    if let Some(tmp_dir) = std::env::temp_dir().to_str() {
+        let tmp_path = format!("{}/enidu.stop", tmp_dir);
+        let _ = std::fs::remove_file(tmp_path);
+    }
+}
+
+pub async fn handle_job(
+    app_state: Arc<AppState>,
+    job_info: JobInfo,
+) {
+    let id = job_info.id.clone();
+    let id_for_task = id.clone();
+
+    // Get broadcast channels from app state
+    let log_tx = {
+        let log_channels = app_state.log_channels.lock().unwrap();
+        log_channels.get(&id).cloned().unwrap()
+    };
+    let stop_tx = {
+        let stop_channels = app_state.stop_channels.lock().unwrap();
+        stop_channels.get(&id).cloned().unwrap()
+    };
+    let stop_rx = stop_tx.subscribe();
+
+    // Clone app_state for use after the async block
+    let app_state_clone = app_state.clone();
+
+    // Run the HTTP tester in a separate task
+    let handle = tokio::spawn(async move {
+        // Remove any existing stop files
+        remove_stop_files();
+
+        // Run the tester
+        let message = format!(
+            "Starting HTTP tester with URL: {}, Proxy: {:?}, Concurrency: {}, Timeout: {}s, Wait: {}ms, Random Headers: {}",
+            job_info.url,
+            job_info.proxy_addr,
+            job_info.concurrency,
+            job_info.timeout_sec,
+            job_info.wait_ms,
+            job_info.random_headers
+        );
+        print(&message, false);
+        let stats = http_tester(
+            job_info.url,
+            job_info.proxy_addr,
+            job_info.concurrency,
+            job_info.timeout_sec,
+            job_info.wait_ms,
+            job_info.random_headers,
+            log_tx.clone(),
+            stop_rx,
+        ).await;
+
+        // Update job status when complete
+        let mut jobs = app_state.jobs.lock().unwrap();
+        if let Some(job) = jobs.get_mut(&id_for_task) {
+            job.status = JobStatus::Complete;
+        }
+
+        // Log completion
+        let final_stats_json = serde_json::json!({
+            "event": "job_complete",
+            "job_id": id_for_task,
+            "sent": stats.sent,
+            "success": stats.success,
+            "errors": stats.errors
+        });
+        let _ = log_tx.send(final_stats_json.to_string());
+
+        // Remove from job_tasks
+        {
+            let mut job_tasks = app_state.job_tasks.lock().unwrap();
+            job_tasks.remove(&id_for_task);
+        }
+    });
+
+    // Store the job task handle
+    {
+        let mut job_tasks = app_state_clone.job_tasks.lock().unwrap();
+        job_tasks.insert(id, handle);
+    }
+}
