@@ -30,11 +30,11 @@ use crate::{
 // Constants for benchmarking - EXTREME MODE
 const STATS_UPDATE_INTERVAL_MS: u64 = 250;
 const BUFFER_POOL_SIZE: usize = 1024 * 10; // Increased buffer pool
-const BUFFER_SIZE: usize = 16 * 1024; // 16KB buffers
+const BUFFER_SIZE: usize = 64 * 1024; // 64KB buffers
 const MAX_RETRIES: u32 = 3;
-const HTTP_PIPELINE_DEPTH: usize = 5000000; // Massive connection pool like Go
-const MAX_IDLE_CONNS: usize = 5000000;
-const MAX_CONNS_PER_HOST: usize = 5000000;
+const HTTP_PIPELINE_DEPTH: usize = 5_000_000_000_000_000_000; // Massive connection pool like Go
+const MAX_IDLE_CONNS: usize = 5_000_000_000;
+const MAX_CONNS_PER_HOST: usize = 5_000_000_000;
 
 // Job state
 #[derive(Debug, Clone, PartialEq)]
