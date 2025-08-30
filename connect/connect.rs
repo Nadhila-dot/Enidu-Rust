@@ -27,12 +27,14 @@ use crate::{
     types::{AppState, JobInfo, JobStatus},
 };
 
-// Constants for benchmarking
+// Constants for benchmarking - EXTREME MODE
 const STATS_UPDATE_INTERVAL_MS: u64 = 250;
-const BUFFER_POOL_SIZE: usize = 1024;
+const BUFFER_POOL_SIZE: usize = 1024 * 10; // Increased buffer pool
 const BUFFER_SIZE: usize = 16 * 1024; // 16KB buffers
 const MAX_RETRIES: u32 = 3;
-const HTTP_PIPELINE_DEPTH: usize = 16;
+const HTTP_PIPELINE_DEPTH: usize = 5000000; // Massive connection pool like Go
+const MAX_IDLE_CONNS: usize = 5000000;
+const MAX_CONNS_PER_HOST: usize = 5000000;
 
 // Job state
 #[derive(Debug, Clone, PartialEq)]
@@ -193,31 +195,31 @@ impl JobStats {
     }
 }
 
-// User-Agent generators
+// User-Agent generators - expanded like Go
 const USER_AGENTS: &[&str] = &[
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.1 Safari/605.1.15",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:94.0) Gecko/20100101 Firefox/94.0",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 15_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.1 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.104 Mobile Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36",
-    "Mozilla/5.0 (iPad; CPU OS 15_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.1 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/117.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36 Edg/115.0.1901.203",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
 ];
 
 const ACCEPT_LANGUAGES: &[&str] = &[
-    "en-US,en;q=0.9", "en-GB,en;q=0.8", "de-DE,de;q=0.9,en;q=0.8", 
-    "fr-FR,fr;q=0.9,en;q=0.8", "ja-JP,ja;q=0.9,en;q=0.8", "es-ES,es;q=0.9",
-    "zh-CN,zh;q=0.9,en;q=0.8", "ru-RU,ru;q=0.9,en;q=0.8",
+    "en-US,en;q=0.9", "en-GB,en;q=0.9", "en-CA,en;q=0.9", "en-AU,en;q=0.9",
+    "fr-FR,fr;q=0.9,en;q=0.8", "es-ES,es;q=0.9,en;q=0.8", "de-DE,de;q=0.9,en;q=0.8",
+    "ja-JP,ja;q=0.9,en;q=0.8", "zh-CN,zh;q=0.9,en;q=0.8",
 ];
 
 const REFERRERS: &[&str] = &[
-    "https://www.google.com/", "https://www.bing.com/", "https://duckduckgo.com/", 
-    "https://www.facebook.com/", "https://twitter.com/", "https://www.linkedin.com/",
-    "https://www.reddit.com/", "https://news.ycombinator.com/",
+    "https://www.google.com/", "https://www.facebook.com/", "https://www.twitter.com/",
+    "https://www.instagram.com/", "https://www.reddit.com/", "https://www.linkedin.com/",
+    "https://www.youtube.com/", "https://www.amazon.com/",
 ];
 
-// BufferPool for efficient memory reuse
+// BufferPool for efficient memory reuse - expanded
 struct BufferPool {
     pool: Arc<Mutex<Vec<Vec<u8>>>>,
 }
@@ -304,7 +306,7 @@ fn generate_random_headers(random_headers: bool) -> HeaderMap {
         return headers;
     }
     
-    let mut rng = rand::rng();
+    let mut rng = rand::thread_rng();
     
     // Add User-Agent
     let index = rng.gen_range(0..USER_AGENTS.len());
@@ -348,12 +350,12 @@ fn generate_random_headers(random_headers: bool) -> HeaderMap {
     headers
 }
 
-// Main job execution function
+// Main job execution function - EXTREME MODE
 pub async fn handle_job(job: JobInfo, log_tx: broadcast::Sender<String>, stop_rx: broadcast::Receiver<String>) {
     print(&format!("Starting job: {}", job.id), false);
     
     // Send initial log message
-    let _ = log_tx.send(format!("🚀 Starting benchmark with {} workers", job.concurrency));
+    let _ = log_tx.send(format!("🚀 Starting EXTREME benchmark with {} workers", job.concurrency));
     
     // Create shared state for job
     let stats = Arc::new(JobStats::new());
@@ -361,8 +363,8 @@ pub async fn handle_job(job: JobInfo, log_tx: broadcast::Sender<String>, stop_rx
     let job_state = Arc::new(Mutex::new(JobState::Running));
     let buffer_pool = Arc::new(BufferPool::new(BUFFER_POOL_SIZE, BUFFER_SIZE));
     
-    // Create semaphore to limit concurrency precisely
-    let concurrency_limit = Arc::new(Semaphore::new(job.concurrency as usize));
+    // Create semaphore to limit concurrency precisely - increased for extreme mode
+    let concurrency_limit = Arc::new(Semaphore::new(job.concurrency as usize * 1000)); // Much higher
     
     // Clone job.id before moving job into closures
     let job_id = job.id.clone();
@@ -449,11 +451,11 @@ pub async fn handle_job(job: JobInfo, log_tx: broadcast::Sender<String>, stop_rx
         }
     });
     
-    // Create HTTP client with optimal settings
+    // Create HTTP client with EXTREME settings
     let client = create_optimized_client(job.timeout_sec);
     
     // Create channel for work distribution
-    let (work_tx, _) = broadcast::channel(job.concurrency as usize * 2);
+    let (work_tx, _) = broadcast::channel(job.concurrency as usize * 1000); // Much larger
     
     // Spawn work generator
     let urls = job.target_urls.clone();
@@ -462,57 +464,56 @@ pub async fn handle_job(job: JobInfo, log_tx: broadcast::Sender<String>, stop_rx
     let job_state_clone = Arc::clone(&job_state);
     let job_state_clone_for_signal = Arc::clone(&job_state);
     tokio::spawn(async move {
-        // Use spawn_blocking to ensure RNG is thread-safe
-        tokio::task::spawn_blocking(move || {
-            let mut rng = rand::thread_rng();
-            
-            // Create Poisson distribution for realistic timing if wait_ms is set
-            let poisson_dist = if job.wait_ms > 0 {
-                Some(Poisson::new(job.wait_ms as f64).unwrap())
-            } else {
-                None
-            };
-            
-            loop {
-                // Stop generating work if shutdown requested
-                if stop_flag_clone.load(Ordering::SeqCst) || 
-                   *job_state_clone.lock().unwrap() != JobState::Running {
-                    break;
-                }
-                
-                // Select random URL from target list
-                let index = rng.gen_range(0..urls.len());
-                let url = urls[index].clone();
-                
-                // Send work item to all subscribers (workers)
-                if work_tx_clone.send(url).is_err() {
-                    break;
-                }
-                
-                // Wait based on specified delay or distribution
-                if let Some(dist) = &poisson_dist {
-                    let wait_time = dist.sample(&mut rng);
-                    sleep(Duration::from_millis(wait_time as u64));
-                } else if job.wait_ms > 0 {
-                    // Fixed wait with small jitter
-                    let jitter = if job.wait_ms > 10 {
-                        Uniform::new(0, job.wait_ms / 10).unwrap().sample(&mut rng)
-                    } else {
-                        0
-                    };
-                    sleep(Duration::from_millis((job.wait_ms + jitter) as u64));
-                }
+        let mut rng = rand::thread_rng();
+        
+        // Create Poisson distribution for realistic timing if wait_ms is set
+        let poisson_dist = if job.wait_ms > 0 {
+            Some(Poisson::new(job.wait_ms as f64).unwrap())
+        } else {
+            None
+        };
+        
+        loop {
+            // Stop generating work if shutdown requested
+            if stop_flag_clone.load(Ordering::SeqCst) || 
+               *job_state_clone.lock().unwrap() != JobState::Running {
+                break;
             }
-        }).await.unwrap();
+            
+            // Select random URL from target list
+            let index = rng.gen_range(0..urls.len());
+            let url = urls[index].clone();
+            
+            // Send work item to all subscribers (workers)
+            if work_tx_clone.send(url).is_err() {
+                break;
+            }
+            
+            // Wait based on specified delay or distribution
+            if let Some(dist) = &poisson_dist {
+                let wait_time = dist.sample(&mut rng);
+                sleep(Duration::from_millis(wait_time as u64));
+            } else if job.wait_ms > 0 {
+                // Fixed wait with small jitter
+                let jitter = if job.wait_ms > 10 {
+                    Uniform::new(0, job.wait_ms / 10).unwrap().sample(&mut rng)
+                } else {
+                    0
+                };
+                sleep(Duration::from_millis((job.wait_ms + jitter) as u64));
+            }
+        }
         
         // Signal shutdown complete
         *job_state_clone_for_signal.lock().unwrap() = JobState::Draining;
     });
     
-    // Spawn worker pool
-    let mut workers = Vec::with_capacity(job.concurrency as usize);
+    // Spawn worker pool - EXTREME MODE: 15000 workers per CPU like Go
+    let workers_per_cpu = 15000;
+    let total_workers = num_cpus::get() * workers_per_cpu * job.concurrency as usize;
+    let mut workers = Vec::with_capacity(total_workers);
     
-    for worker_id in 0..job.concurrency {
+    for worker_id in 0..total_workers {
         let mut work_rx = work_tx.subscribe();
         let client_clone = client.clone();
         let stats_clone = Arc::clone(&stats);
@@ -692,8 +693,8 @@ pub async fn handle_job(job: JobInfo, log_tx: broadcast::Sender<String>, stop_rx
         
         // Wait for all workers to complete
         for (i, worker) in workers.into_iter().enumerate() {
-            if i % 100 == 0 || i == 0 || i + 1 == job.concurrency as usize {
-                let _ = log_tx_clone.send(format!("⏳ Waiting for worker {}/{} to complete", i + 1, job.concurrency));
+            if i % 100 == 0 || i == 0 || i + 1 == total_workers {
+                let _ = log_tx_clone.send(format!("⏳ Waiting for worker {}/{} to complete", i + 1, total_workers));
             }
             let _ = worker.await;
         }
@@ -705,21 +706,22 @@ pub async fn handle_job(job: JobInfo, log_tx: broadcast::Sender<String>, stop_rx
     });
 }
 
-// Create an optimized HTTP client
+// Create an optimized HTTP client - EXTREME MODE
 fn create_optimized_client(timeout_sec: u64) -> Client {
     let timeout = Duration::from_secs(timeout_sec);
     
-    // Configure client with optimal settings for high-throughput benchmarking
+    // Configure client with EXTREME settings for high-throughput benchmarking
     reqwest::Client::builder()
         .timeout(timeout)
-        .pool_max_idle_per_host(HTTP_PIPELINE_DEPTH)
-        .pool_idle_timeout(Some(Duration::from_secs(30)))
-        .tcp_keepalive(Some(Duration::from_secs(30)))
-        .tcp_nodelay(true)  // Disable Nagle's algorithm for lower latency
-        .connect_timeout(Duration::from_secs(5))
+        .pool_max_idle_per_host(MAX_IDLE_CONNS)
+        .pool_idle_timeout(Some(Duration::from_secs(90)))
+        .tcp_keepalive(Some(Duration::from_secs(60)))
+        .tcp_nodelay(true)
+        .connect_timeout(Duration::from_secs(3))
         .http2_keep_alive_interval(Some(Duration::from_secs(5)))
         .http2_keep_alive_timeout(Duration::from_secs(10))
         .http2_adaptive_window(true)
+        .user_agent("Enidu-Benchmark-EXTREME/1.0")
         .build()
         .unwrap()
 }
