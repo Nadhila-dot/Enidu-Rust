@@ -21,9 +21,12 @@ pub struct JobInfo {
     pub wait_ms: u32,
     pub random_headers: bool,
     pub proxy_addr: Option<String>,
-    pub status: JobStatus,
+    pub target_urls: Vec<String>,
+    pub custom_body: Option<String>,
+    pub method: String,
+    pub status: crate::types::JobStatus, // Add this line
+    pub disable_rate_limit: bool,
 }
-
 #[derive(Clone)] // Removed Default derive
 pub struct AppState {
     pub jobs: Arc<Mutex<HashMap<String, JobInfo>>>,

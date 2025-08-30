@@ -1,0 +1,1330 @@
+use futures::future;
+use rand::Rng;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::Write;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::broadcast;
+use tokio::sync::mpsc;
+use tokio::time::sleep;
+use tokio_rustls::{rustls, TlsConnector};
+use rustls::{
+    ClientConfig, RootCertStore, DigitallySignedStruct, SignatureScheme
+};
+use rustls::pki_types::{ServerName, CertificateDer, UnixTime};
+use rustls::client::danger::{ServerCertVerified, HandshakeSignatureValid};
+use std::fmt::Debug;
+//@rs-ignore
+use rand::thread_rng;
+
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+
+use crate::connect::json::daemon_json;
+use crate::libs::logs::print;
+use crate::types::{AppState, JobInfo, JobStatus};
+use crate::env::container::get_system_stats;
+use url::Url;
+use bytes::BytesMut;
+
+// Shutdown phases for controlled resource reduction
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownPhase {
+    Running,
+    ShuttingDown,
+    Draining,
+    Stopped,
+}
+
+// Statistics structure to track results
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TestStats {
+    pub sent: i64,
+    pub success: i64,
+    pub errors: i64,
+    pub timeouts: i64,
+    pub conn_errors: i64,
+}
+
+// System resource info for auto-scaling
+#[derive(Debug, Clone)]
+struct SystemResources {
+    cpu_usage: f32,
+    memory_available: u64,
+    total_memory: u64,
+}
+
+// Type alias for a boxed stream that implements AsyncRead + AsyncWrite + Send + Unpin
+trait AsyncReadWrite: AsyncRead + AsyncWrite {}
+impl<T: AsyncRead + AsyncWrite + ?Sized> AsyncReadWrite for T {}
+
+type DynStream = Box<dyn AsyncReadWrite + Send + Unpin>;
+
+// Full user agents list for better randomization
+static USER_AGENTS: &[&str] = &[
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/117.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36 Edg/115.0.1901.203",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like creepercloud.io) Version/16.6 Mobile/15E148 Safari/604.1",
+];
+
+// Random referer URLs
+static REFERERS: &[&str] = &[
+    "https://www.google.com/",
+    "https://www.facebook.com/",
+    "https://www.twitter.com/",
+    "https://www.instagram.com/",
+    "https://www.reddit.com/",
+    "https://www.linkedin.com/",
+    "https://www.youtube.com/",
+    "https://www.amazon.com/",
+    "https://www.netflix.com/",
+];
+
+// Random accept language headers
+static ACCEPT_LANGUAGES: &[&str] = &[
+    "en-US,en;q=0.9",
+    "en-GB,en;q=0.9",
+    "en-CA,en;q=0.9",
+    "en-AU,en;q=0.9",
+    "fr-FR,fr;q=0.9,en;q=0.8",
+    "es-ES,es;q=0.9,en;q=0.8",
+    "de-DE,de;q=0.9,en;q=0.8",
+    "ja-JP,ja;q=0.9,en;q=0.8",
+    "zh-CN,zh;q=0.9,en;q=0.8",
+];
+
+// Global atomic counters for stats tracking
+struct AtomicStats {
+    sent: AtomicI64,
+    success: AtomicI64,
+    errors: AtomicI64,
+    timeouts: AtomicI64,
+    conn_errors: AtomicI64,
+}
+
+impl AtomicStats {
+    fn new() -> Self {
+        Self {
+            sent: AtomicI64::new(0),
+            success: AtomicI64::new(0),
+            errors: AtomicI64::new(0),
+            timeouts: AtomicI64::new(0),
+            conn_errors: AtomicI64::new(0),
+        }
+    }
+
+    fn to_test_stats(&self) -> TestStats {
+        TestStats {
+            sent: self.sent.load(Ordering::Relaxed),
+            success: self.success.load(Ordering::Relaxed),
+            errors: self.errors.load(Ordering::Relaxed),
+            timeouts: self.timeouts.load(Ordering::Relaxed),
+            conn_errors: self.conn_errors.load(Ordering::Relaxed),
+        }
+    }
+}
+
+// REMOVE old DummyCertVerifier block and REPLACE with:
+#[derive(Debug)]
+struct NoVerify;
+
+impl rustls::client::danger::ServerCertVerifier for NoVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ED25519,
+            SignatureScheme::RSA_PKCS1_SHA256,
+        ]
+    }
+}
+
+// NEW: Raw HTTP Client for high-performance requests
+#[derive(Clone)]
+pub struct RawHttpClient {
+    timeout: Duration,
+    connect_timeout: Duration,
+    pool: Arc<ConnectionPool>,
+    tls_connector: Arc<TlsConnector>,
+    proxy_addr: Option<String>,
+}
+
+impl RawHttpClient {
+    pub fn builder() -> RawHttpClientBuilder {
+        RawHttpClientBuilder::new()
+    }
+
+    // Send raw HTTP GET request
+    pub async fn get(&self, url: &str) -> Result<RawHttpResponse, std::io::Error> {
+        let headers = HashMap::new();
+        self.send_request(url, "GET", headers).await
+    }
+
+    // Send request with method and headers
+    pub async fn send_request(
+        &self,
+        url: &str,
+        method: &str,
+        headers: HashMap<String, String>
+    ) -> Result<RawHttpResponse, std::io::Error> {
+        let parsed_url = Url::parse(url)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid URL"))?;
+
+        let host = parsed_url.host_str().unwrap_or("localhost");
+        let port = parsed_url.port().unwrap_or(if parsed_url.scheme() == "https" { 443 } else { 80 });
+        let use_tls = parsed_url.scheme() == "https";
+
+        let mut stream = self.pool.get_connection(host, port, use_tls, &self.tls_connector).await?;
+
+        // Build path + query (Url has no path_and_query())
+        let mut path = parsed_url.path().to_string();
+        if path.is_empty() {
+            path = "/".to_string();
+        }
+        if let Some(q) = parsed_url.query() {
+            path.push('?');
+            path.push_str(q);
+        }
+
+        let mut request = format!("{} {} HTTP/1.1\r\n", method, path);
+        request.push_str(&format!("Host: {}\r\n", host));
+        request.push_str("Connection: keep-alive\r\n");
+        for (k, v) in headers {
+            request.push_str(&format!("{}: {}\r\n", k, v));
+        }
+        request.push_str("\r\n");
+        stream.write_all(request.as_bytes()).await?;
+
+        let read_timeout = self.timeout;
+        let mut response = String::new();
+        let read_result = tokio::time::timeout(read_timeout, async {
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                if let Ok(s) = std::str::from_utf8(&buf[..n]) {
+                    response.push_str(s);
+                    if response.contains("\r\n\r\n") {
+                        // simple break after headers+body start (optional)
+                    }
+                }
+            }
+            Ok::<(), std::io::Error>(())
+        }).await;
+
+        match read_result {
+            Ok(Ok(_)) => {
+                self.pool.return_connection(host, port, use_tls, stream).await;
+                let status_code = response
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|code| code.parse::<u16>().ok())
+                    .unwrap_or(0);
+                Ok(RawHttpResponse { status: status_code, body: response })
+            }
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Request timed out")),
+        }
+    }
+}
+
+// Response type
+pub struct RawHttpResponse {
+    pub status: u16,
+    pub body: String,
+}
+
+impl RawHttpResponse {
+    pub fn is_success(&self) -> bool {
+        self.status >= 200 && self.status < 300
+    }
+}
+
+// Builder for RawHttpClient
+pub struct RawHttpClientBuilder {
+    timeout: Duration,
+    connect_timeout: Duration,
+    pool_idle_timeout: Duration,
+    danger_accept_invalid_certs: bool,
+    proxy_addr: Option<String>,
+}
+
+impl RawHttpClientBuilder {
+    pub fn new() -> Self {
+        Self {
+            timeout: Duration::from_millis(100),
+            connect_timeout: Duration::from_millis(50),
+            pool_idle_timeout: Duration::from_secs(60),
+            danger_accept_invalid_certs: true,
+            proxy_addr: None,
+        }
+    }
+    
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+    
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+    
+    pub fn pool_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.pool_idle_timeout = timeout;
+        self
+    }
+    
+    pub fn danger_accept_invalid_certs(mut self, accept: bool) -> Self {
+        self.danger_accept_invalid_certs = accept;
+        self
+    }
+    
+    pub fn proxy(mut self, proxy_addr: &str) -> Self {
+        self.proxy_addr = Some(proxy_addr.to_string());
+        self
+    }
+    
+    pub fn build(self) -> Result<RawHttpClient, std::io::Error> {
+        let mut root_store = RootCertStore::empty();
+        // Updated for rustls 0.23+ API - Use add_server_trust_anchors for webpki-roots
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        
+        let mut config = ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        if self.danger_accept_invalid_certs {
+            config.dangerous().set_certificate_verifier(Arc::new(NoVerify));
+        }
+
+        let tls_connector = TlsConnector::from(Arc::new(config));
+        Ok(RawHttpClient {
+            timeout: self.timeout,
+            connect_timeout: self.connect_timeout,
+            pool: Arc::new(ConnectionPool::new(self.pool_idle_timeout)),
+            tls_connector: Arc::new(tls_connector),
+            proxy_addr: self.proxy_addr,
+        })
+    }
+}
+
+// REPLACEMENT: More aggressive connection pooling implementation
+pub struct ConnectionPool {
+    pools: dashmap::DashMap<String, tokio::sync::Mutex<Vec<DynStream>>>,
+    idle_timeout: Duration,
+    // Track pool metrics
+    total_connections: AtomicU32,
+    max_connections_per_host: usize,
+}
+
+impl ConnectionPool {
+    fn new(idle_timeout: Duration) -> Self {
+        Self {
+            pools: dashmap::DashMap::new(),
+            idle_timeout,
+            total_connections: AtomicU32::new(0),
+            // Massively increase connection pool size (similar to Go's 5,000,000)
+            max_connections_per_host: 5_000_000,
+        }
+    }
+    
+    async fn get_connection(
+        &self,
+        host: &str,
+        port: u16,
+        use_tls: bool,
+        tls_connector: &TlsConnector,
+    ) -> Result<DynStream, std::io::Error> {
+        let key = format!("{}:{}:{}", host, port, use_tls);
+        
+        // First try to get a pooled connection
+        if let Some(pool_entry) = self.pools.get(&key) {
+            let mut pool = pool_entry.lock().await;
+            if let Some(conn) = pool.pop() {
+                return Ok(conn);
+            }
+        }
+        
+        // Create a new connection with optimized socket settings
+        let tcp_stream = match TcpStream::connect((host, port)).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                return Err(err);
+            }
+        };
+        
+        // Apply socket optimizations similar to Go version
+        tcp_stream.set_nodelay(true)?;
+        
+        // Increase receive/send buffer sizes (similar to Go's syscall optimizations)
+        if let Ok(socket) = socket2::Socket::from(tcp_stream.into_std()?) {
+            let _ = socket.set_reuse_address(true);
+            let _ = socket.set_recv_buffer_size(1_048_576); // 1MB like Go version
+            let _ = socket.set_send_buffer_size(1_048_576); // 1MB like Go version
+            
+            // Convert back to TcpStream
+            let std_stream = socket.into();
+            let tcp_stream = TcpStream::from_std(std_stream)?;
+            
+            self.total_connections.fetch_add(1, Ordering::Relaxed);
+            
+            if use_tls {
+                let host_owned = host.to_string();
+                let domain = ServerName::try_from(host_owned)
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid hostname"))?;
+                match tls_connector.connect(domain, tcp_stream).await {
+                    Ok(tls_stream) => Ok(Box::new(tls_stream)),
+                    Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
+                }
+            } else {
+                Ok(Box::new(tcp_stream))
+            }
+        } else {
+            // Fallback if socket2 fails
+            self.total_connections.fetch_add(1, Ordering::Relaxed);
+            
+            if use_tls {
+                let host_owned = host.to_string();
+                let domain = ServerName::try_from(host_owned)
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid hostname"))?;
+                let tls_stream = tls_connector.connect(domain, tcp_stream).await?;
+                Ok(Box::new(tls_stream))
+            } else {
+                Ok(Box::new(tcp_stream))
+            }
+        }
+    }
+
+    async fn return_connection(
+        &self,
+        host: &str,
+        port: u16,
+        use_tls: bool,
+        conn: DynStream,
+    ) {
+        let key = format!("{}:{}:{}", host, port, use_tls);
+        let entry = self.pools.entry(key).or_insert_with(|| tokio::sync::Mutex::new(Vec::new()));
+        let mut pool = entry.lock().await;
+        
+        // Keep much more connections in the pool, similar to Go version
+        if pool.len() < self.max_connections_per_host {
+            pool.push(conn);
+        }
+    }
+    
+    // Get pool stats for monitoring
+    fn get_stats(&self) -> (u32, usize) {
+        let total = self.total_connections.load(Ordering::Relaxed);
+        let active_hosts = self.pools.len();
+        (total, active_hosts)
+    }
+}
+
+// Add a request template builder similar to Go version
+struct RequestTemplate {
+    method: String,
+    path: String,
+    host: String,
+    base_headers: HashMap<String, String>,
+}
+
+impl RequestTemplate {
+    fn new(method: &str, url: &str) -> Result<Self, std::io::Error> {
+        let parsed_url = Url::parse(url)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid URL"))?;
+            
+        let host = parsed_url.host_str()
+            .unwrap_or("localhost")
+            .to_string();
+            
+        let mut path = parsed_url.path().to_string();
+        if path.is_empty() {
+            path = "/".to_string();
+        }
+        if let Some(q) = parsed_url.query() {
+            path.push('?');
+            path.push_str(q);
+        }
+        
+        let mut base_headers = HashMap::new();
+        base_headers.insert("Host".to_string(), host.clone());
+        base_headers.insert("Connection".to_string(), "keep-alive".to_string());
+        base_headers.insert("Accept".to_string(), "*/*".to_string());
+        
+        Ok(Self {
+            method: method.to_string(),
+            path,
+            host,
+            base_headers,
+        })
+    }
+    
+    fn build_request(&self, additional_headers: HashMap<String, String>) -> String {
+        let mut request = format!("{} {} HTTP/1.1\r\n", self.method, self.path);
+        
+        // Add base headers first
+        for (k, v) in &self.base_headers {
+            request.push_str(&format!("{}: {}\r\n", k, v));
+        }
+        
+        // Add additional headers, overriding base headers if needed
+        for (k, v) in additional_headers {
+            request.push_str(&format!("{}: {}\r\n", k, v));
+        }
+        
+        request.push_str("\r\n");
+        request
+    }
+}
+
+// Enhance RawHttpClient with retry logic and request templates
+impl RawHttpClient {
+    // ...existing code...
+    
+    // Send request with retry logic (similar to Go version)
+    pub async fn send_request_with_retry(
+        &self,
+        url: &str,
+        method: &str,
+        headers: HashMap<String, String>,
+        max_retries: usize,
+    ) -> Result<RawHttpResponse, std::io::Error> {
+        let mut rng = rand::thread_rng();
+        let backoff_base = Duration::from_millis(50);
+        
+        // Create request template for reuse
+        let template = RequestTemplate::new(method, url)?;
+        
+        for retry in 0..=max_retries {
+            // Check shutdown flag if we're in worker context
+            if let Some(phase) = CURRENT_SHUTDOWN_PHASE.get() {
+                if *phase >= ShutdownPhase::Draining as u32 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted, 
+                        "Operation interrupted due to shutdown"
+                    ));
+                }
+            }
+            
+            let result = self.send_request_with_template(&template, headers.clone()).await;
+            
+            match &result {
+                Ok(response) if response.is_success() => return result,
+                Ok(_) => {
+                    // Non-2xx response, might retry depending on status
+                    if retry == max_retries {
+                        return result;
+                    }
+                },
+                Err(e) if is_connection_error(e) => {
+                    if retry == max_retries {
+                        return result;
+                    }
+                    
+                    // Apply exponential backoff with jitter
+                    let backoff = backoff_base * 2u32.pow(retry as u32);
+                    let jitter = Duration::from_millis(rng.gen_range(0..backoff.as_millis() as u64 / 2));
+                    tokio::time::sleep(backoff + jitter).await;
+                },
+                _ => return result, // Other errors are not retryable
+            }
+        }
+        
+        // Should never reach here due to the returns above
+        unreachable!()
+    }
+    
+    // Send request using a pre-built template (more efficient)
+    async fn send_request_with_template(
+        &self,
+        template: &RequestTemplate,
+        headers: HashMap<String, String>,
+    ) -> Result<RawHttpResponse, std::io::Error> {
+        let parsed_url = Url::parse(&format!("http://{}{}", template.host, template.path))
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid URL"))?;
+            
+        let host = &template.host;
+        let port = parsed_url.port().unwrap_or(if parsed_url.scheme() == "https" { 443 } else { 80 });
+        let use_tls = parsed_url.scheme() == "https";
+        
+        let mut stream = self.pool.get_connection(host, port, use_tls, &self.tls_connector).await?;
+        
+        // Build the request using the template
+        let request = template.build_request(headers);
+        stream.write_all(request.as_bytes()).await?;
+        
+        // Rest of the function remains the same as original send_request
+        let read_timeout = self.timeout;
+        let mut buffer = BytesMut::with_capacity(16384); // Larger buffer for performance
+        
+        let read_result = tokio::time::timeout(read_timeout, async {
+            loop {
+                let mut chunk = vec![0u8; 8192];
+                let n = stream.read(&mut chunk).await?;
+                if n == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..n]);
+                
+                // Check if we have headers and a complete body
+                if let Ok(response_str) = std::str::from_utf8(&buffer) {
+                    if response_str.contains("\r\n\r\n") {
+                        // Found the end of headers, could check for content-length to determine if complete
+                        break;
+                    }
+                }
+            }
+            Ok::<(), std::io::Error>(())
+        }).await;
+        
+        match read_result {
+            Ok(Ok(_)) => {
+                // Return connection to the pool for reuse
+                self.pool.return_connection(host, port, use_tls, stream).await;
+                
+                // Parse the response
+                let response_str = String::from_utf8_lossy(&buffer).to_string();
+                let status_code = response_str
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|code| code.parse::<u16>().ok())
+                    .unwrap_or(0);
+                    
+                Ok(RawHttpResponse { status: status_code, body: response_str })
+            },
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Request timed out")),
+        }
+    }
+}
+
+// Helper to check if an error is a connection-related error (like in Go version)
+fn is_connection_error(err: &std::io::Error) -> bool {
+    let error_str = err.to_string().to_lowercase();
+    error_str.contains("connection") || 
+        error_str.contains("reset") || 
+        error_str.contains("broken pipe") || 
+        error_str.contains("eof") || 
+        error_str.contains("i/o timeout")
+}
+
+// Add thread_local for tracking shutdown phase in each worker thread
+thread_local! {
+    static CURRENT_SHUTDOWN_PHASE: std::cell::RefCell<Option<u32>> = std::cell::RefCell::new(None);
+}
+
+// Monitor system resources for auto-scaling
+fn monitor_system_resources() -> SystemResources {
+    let sys = get_system_stats();
+    let mem_available = sys.total_memory() - sys.used_memory();
+    let cpu_usage = 1.0 - (mem_available as f32 / sys.total_memory() as f32);
+    
+    SystemResources {
+        cpu_usage,
+        memory_available: mem_available,
+        total_memory: sys.total_memory(),
+    }
+}
+
+// Read max workers from .env file
+fn get_max_workers_from_env() -> Option<u32> {
+    if let Ok(env_content) = std::fs::read_to_string(".env") {
+        for line in env_content.lines() {
+            if let Some(value) = line.strip_prefix("MAX_WORKERS=") {
+                return value.trim().parse().ok();
+            }
+        }
+    }
+    None
+}
+
+// Dynamic concurrency adjustment based on system resources
+fn adjust_concurrency(
+    semaphore: &tokio::sync::Semaphore, 
+    resources: &SystemResources,
+    target_concurrency: u32,
+    current_rps: u32,
+    target_rps: u32
+) {
+    let current_permits = semaphore.available_permits();
+    
+    // More aggressive memory factor
+    let memory_factor = if resources.memory_available < (resources.total_memory / 10) {
+        2.0
+    } else if resources.memory_available < (resources.total_memory / 5) {
+        0.6
+    } else {
+        1.2 // Actually increase when memory is good
+    };
+    
+    // RPS-based adjustment
+    let rps_factor = if current_rps < target_rps / 2 {
+        1.5 // Boost when RPS is too low
+    } else if current_rps > target_rps {
+        0.9 // Slight reduction when target exceeded
+    } else {
+        1.1 // Slight increase otherwise
+    };
+    
+    let target_permits = (target_concurrency as f32 * memory_factor * rps_factor) as usize;
+    let target_permits = std::cmp::min(target_permits, 50_000_000); // Massive cap
+    
+    let diff = target_permits as isize - current_permits as isize;
+    if diff > 0 {
+        semaphore.add_permits(diff as usize);
+    }
+}
+
+// UPDATED: Raw TCP-based HTTP tester (replaces reqwest-based one)
+pub async fn http_tester(
+    target_url: String,
+    proxy_addr: Option<String>,
+    concurrency: u32,
+    timeout_sec: u64,
+    wait_ms: u32,
+    random_headers: bool,
+    log_tx: broadcast::Sender<String>,
+    mut stop_rx: broadcast::Receiver<String>,
+) -> TestStats {
+    // Send initial message
+    let _ = log_tx.send(daemon_json("update", &format!("RAW TCP MODE: Launching Job for {}", target_url)));
+    let _ = log_tx.send(daemon_json("update", &format!("Using base concurrency: {}", concurrency)));
+
+    // Create atomic stats counters
+    let stats = Arc::new(AtomicStats::new());
+
+    // Track shutdown state
+    let shutdown_phase = Arc::new(AtomicU32::new(ShutdownPhase::Running as u32));
+    let stop_flag = Arc::new(tokio::sync::Notify::new());
+    let is_stopping = Arc::new(AtomicBool::new(false));
+
+    // Get MAX_WORKERS from .env or calculate massive default
+    let max_workers_from_env = get_max_workers_from_env();
+    let _ = log_tx.send(daemon_json("update", &format!("MAX_WORKERS from .env: {:?}", max_workers_from_env)));
+
+    // Ultra-aggressive semaphore - use env value or massive calculated value
+    let max_concurrent_requests = std::cmp::min(concurrency as u64 * 5_000_000u64, 4_294_967_295u64) as u32;
+    
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_requests as usize));
+
+    // NEW: Create raw HTTP client (replaces reqwest client)
+    let mut raw_client_builder = RawHttpClient::builder()
+        .timeout(Duration::from_millis(100))  // Fast timeout for quicker cycles
+        .connect_timeout(Duration::from_millis(50))  // Fast connects
+        .pool_idle_timeout(Duration::from_secs(60))  // Long idle time
+        .danger_accept_invalid_certs(true);  // Skip cert verification for speed
+    
+    // Add proxy if specified
+    if let Some(proxy_url) = proxy_addr.clone() {
+        raw_client_builder = raw_client_builder.proxy(&proxy_url);
+        let _ = log_tx.send(daemon_json("info", &format!("Using proxy: {}", proxy_url)));
+    }
+    
+    let client = match raw_client_builder.build() {
+        Ok(client) => Arc::new(client),
+        Err(e) => {
+            let _ = log_tx.send(daemon_json("error", &format!("Error building raw HTTP client: {}", e)));
+            return TestStats::default();
+        }
+    };
+
+    // Create ultra-fast stop file watcher
+    let mut stop_file_watcher = create_stop_file_watcher();
+
+    // Setup enhanced resource monitoring for auto-scaling
+    let target_concurrency = Arc::new(AtomicU32::new(max_concurrent_requests));
+    let current_rps = Arc::new(AtomicU32::new(0));
+    let semaphore_clone = semaphore.clone();
+    let target_concurrency_clone = target_concurrency.clone();
+    let current_rps_clone = current_rps.clone();
+    
+    // Enhanced resource monitoring task
+    let resource_monitor_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            interval.tick().await;
+            
+            let resources = monitor_system_resources();
+            let rps = current_rps_clone.load(Ordering::Relaxed);
+            let target_rps = 10_000_000; 
+            
+            adjust_concurrency(
+                &semaphore_clone, 
+                &resources,
+                target_concurrency_clone.load(Ordering::Relaxed),
+                rps,
+                target_rps
+            );
+        }
+    });
+
+    // Clone stop_rx for workers before moving to monitor
+    let stop_rx_workers = stop_rx.resubscribe();
+
+    let shutdown_phase_clone = shutdown_phase.clone();
+    let log_tx_clone = log_tx.clone();
+    let is_stopping_clone = is_stopping.clone();
+    let stop_flag_clone = stop_flag.clone();
+
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = stop_rx.recv() => {
+                let _ = log_tx_clone.send(daemon_json("action", "Stopping server.... initiating Shutdown..."));
+                is_stopping_clone.store(true, Ordering::SeqCst);
+                shutdown_phase_clone.store(ShutdownPhase::ShuttingDown as u32, Ordering::SeqCst);
+                stop_flag_clone.notify_waiters();
+            }
+            _ = stop_file_watcher.recv() => {
+                let _ = log_tx_clone.send(daemon_json("action", "Stopping server.... initiating Shutdown..."));
+                is_stopping_clone.store(true, Ordering::SeqCst);
+                shutdown_phase_clone.store(ShutdownPhase::ShuttingDown as u32, Ordering::SeqCst);
+                stop_flag_clone.notify_waiters();
+            }
+        }
+    });
+
+    // Enhanced stats printer task with RPS tracking
+    let stats_clone = stats.clone();
+    let is_stopping_clone = is_stopping.clone();
+    let current_rps_clone = current_rps.clone();
+    let log_tx_stats = log_tx.clone();
+    
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(1000));
+        let start_time = std::time::Instant::now();
+        let mut last_sent = 0;
+        let mut last_success = 0;
+        
+        loop {
+            interval.tick().await;
+            
+            if is_stopping_clone.load(Ordering::Relaxed) {
+                break;
+            }
+            
+            let current_stats = stats_clone.to_test_stats();
+            let elapsed = start_time.elapsed().as_secs_f64();
+            
+            let sent_diff = current_stats.sent - last_sent;
+            let success_diff = current_stats.success - last_success;
+            
+            // Update current RPS for resource monitoring
+            current_rps_clone.store(sent_diff as u32, Ordering::Relaxed);
+            
+            let stats_json = serde_json::json!({
+                "event": "update",
+                "time": elapsed,
+                "sent": current_stats.sent,
+                "sent_per_sec": sent_diff,
+                "success": current_stats.success,
+                "success_per_sec": success_diff,
+                "errors": current_stats.errors,
+                "timeouts": current_stats.timeouts,
+                "conn_errors": current_stats.conn_errors
+            });
+            let _ = log_tx_stats.send(stats_json.to_string());
+            
+            last_sent = current_stats.sent;
+            last_success = current_stats.success;
+        }
+    });
+
+    // Calculate workers with ultra-aggressive scaling
+    let num_cpus = num_cpus::get() as u32;
+    let resources = monitor_system_resources();
+    let memory_gb = resources.total_memory / (1024 * 1024 * 1024);
+
+    // Use env variable if set, otherwise calculate maximum possible
+    let total_workers = if let Some(env_workers) = max_workers_from_env {
+        env_workers
+    } else {
+        let workers_per_cpu = if memory_gb > 32 {
+            45_000_000  // Match Go's scale
+        } else if memory_gb > 16 {
+            40_000_000
+        } else if memory_gb > 8 {
+            5_000_000
+        } else if memory_gb > 4 {
+            1_000_000
+        } else {
+            500_000
+        };
+
+        let target_rps = 50_000_000;
+        let estimated_latency_ms = timeout_sec * 2; // Assume latency up to double timeout
+        let workers_for_rps = (target_rps * estimated_latency_ms / 1000) as u32;
+
+        let memory_kb_per_worker = 500; 
+        let max_memory_workers = ((resources.memory_available / 1024) / memory_kb_per_worker) as u32;
+
+        // Calculate final worker count
+        let calculated_workers = num_cpus * workers_per_cpu;
+        let rps_workers = std::cmp::max(workers_for_rps, calculated_workers);
+        let system_max = std::cmp::min(max_memory_workers, 200_000_000); // Allow up to 200M workers
+        std::cmp::min(rps_workers, system_max)
+    };
+
+    // Log configuration
+    let _ = log_tx.send(daemon_json("update", &format!(
+        "RAW TCP MODE: Target RPS: 10K+, Worker count: {}, CPUs: {}",
+        total_workers, num_cpus
+    )));
+    
+    let inner_json = serde_json::json!({
+        "event": "launch_workers",
+        "workers": total_workers,
+        "cpus": num_cpus,
+        "target_url": target_url,
+        "max_concurrent": max_concurrent_requests,
+        "optimization": "raw_tcp_go_like"
+    }).to_string();
+
+    let quic_msg = daemon_json("update", &inner_json);
+    let _ = log_tx.send(quic_msg);
+    let _ = log_tx.send(daemon_json("update", &format!(
+        "[RAW-TCP-SYS]: {}GB RAM | {} CPUs | {} workers | {} max concurrent",
+        memory_gb, num_cpus, total_workers, max_concurrent_requests
+    )));
+
+    // Start workers with enhanced semaphore control and buffer reuse
+    let mut handles = Vec::new();
+    for _ in 0..total_workers {
+        let client = client.clone();
+        let target_url = target_url.clone();
+        let stats = stats.clone();
+        let shutdown_phase = shutdown_phase.clone();
+        let is_stopping = is_stopping.clone();
+        let stop_flag = stop_flag.clone();
+        let mut stop_rx = stop_rx_workers.resubscribe();
+        let semaphore = semaphore.clone();
+        let template = request_template.clone();
+        let buffer_pool = buffer_pool.clone();
+
+        let handle = tokio::spawn(async move {
+            // Initialize thread-local shutdown phase
+            CURRENT_SHUTDOWN_PHASE.with(|phase| {
+                *phase.borrow_mut() = Some(ShutdownPhase::Running as u32);
+            });
+            
+            // Initialize worker-local RNG with direct seeding
+            let seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or(Duration::from_secs(0))
+                .as_nanos() as u64;
+            let mut rng = StdRng::seed_from_u64(seed);
+            
+            // Reuse headers HashMap
+            let mut headers = HashMap::with_capacity(16);
+            
+            // Track retries and use backoff
+            let max_retries = 3;
+            let backoff_base = Duration::from_millis(50);
+
+            loop {
+                // Track current phase for shutdown
+                let phase = shutdown_phase.load(Ordering::Relaxed);
+                CURRENT_SHUTDOWN_PHASE.with(|cell| {
+                    *cell.borrow_mut() = Some(phase);
+                });
+                
+                // Termination check with multiple conditions for faster response
+                if is_stopping.load(Ordering::Relaxed) || phase >= ShutdownPhase::Draining as u32 {
+                    break;
+                }
+
+                // Get semaphore permit with timeout
+                let permit = match tokio::time::timeout(
+                    Duration::from_millis(50), 
+                    semaphore.acquire()
+                ).await {
+                    Ok(Ok(permit)) => permit,
+                    _ => break, // Exit if can't get permit quickly
+                };
+
+                // Track sent request
+                stats.sent.fetch_add(1, Ordering::Relaxed);
+
+                // Clear and prepare headers for request
+                headers.clear();
+                if random_headers && phase == ShutdownPhase::Running as u32 {
+                    // Apply random headers more efficiently
+                    headers.insert("User-Agent".to_string(), 
+                        USER_AGENTS[rng.gen_range(0..USER_AGENTS.len())].to_string());
+                    headers.insert("Accept-Language".to_string(), 
+                        ACCEPT_LANGUAGES[rng.gen_range(0..ACCEPT_LANGUAGES.len())].to_string());
+                    headers.insert("Cache-Control".to_string(), "no-cache".to_string());
+                    
+                    if rng.gen_bool(0.8) {
+                        headers.insert("Referer".to_string(), 
+                            REFERERS[rng.gen_range(0..REFERERS.len())].to_string());
+                    }
+                    
+                    headers.insert("X-Forwarded-For".to_string(), 
+                        format!("{}.{}.{}.{}", 
+                            rng.gen_range(1..255), 
+                            rng.gen_range(0..255), 
+                            rng.gen_range(0..255), 
+                            rng.gen_range(0..255)
+                        )
+                    );
+                }
+
+                // Super-responsive cancellation with tokio::select!
+                tokio::select! {
+                    _ = stop_rx.recv() => {
+                        drop(permit);
+                        break;
+                    }
+                    _ = stop_flag.notified() => {
+                        drop(permit);
+                        break;
+                    }
+                    result = client.send_request_with_template(&template, headers.clone()) => {
+                        match result {
+                            Ok(response) => {
+                                if response.is_success() {
+                                    stats.success.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    stats.errors.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            Err(e) => {
+                                if e.kind() == std::io::ErrorKind::TimedOut {
+                                    stats.timeouts.fetch_add(1, Ordering::Relaxed);
+                                } else if is_connection_error(&e) {
+                                    stats.conn_errors.fetch_add(1, Ordering::Relaxed);
+                                    
+                                    // Retry connection errors with backoff
+                                    for retry in 0..max_retries {
+                                        if is_stopping.load(Ordering::Relaxed) {
+                                            break;
+                                        }
+                                        
+                                        // Backoff with jitter
+                                        let backoff = backoff_base * 2u32.pow(retry as u32);
+                                        let jitter = Duration::from_millis(
+                                            rng.gen_range(0..backoff.as_millis() as u64 / 2)
+                                        );
+                                        
+                                        tokio::select! {
+                                            _ = tokio::time::sleep(backoff + jitter) => {},
+                                            _ = stop_rx.recv() => break,
+                                            _ = stop_flag.notified() => break,
+                                        }
+                                        
+                                        // Try again
+                                        match client.send_request_with_template(&template, headers.clone()).await {
+                                            Ok(response) => {
+                                                if response.is_success() {
+                                                    stats.success.fetch_add(1, Ordering::Relaxed);
+                                                } else {
+                                                    stats.errors.fetch_add(1, Ordering::Relaxed);
+                                                }
+                                                break;
+                                            }
+                                            Err(retry_err) => {
+                                                if retry == max_retries - 1 {
+                                                    stats.errors.fetch_add(1, Ordering::Relaxed);
+                                                }
+                                                if retry_err.kind() != std::io::ErrorKind::TimedOut && 
+                                                   !is_connection_error(&retry_err) {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    stats.errors.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        drop(permit);
+                    }
+                }
+
+                // Minimal wait with jitter
+                if wait_ms > 0 && phase == ShutdownPhase::Running as u32 {
+                    let jitter = (wait_ms as f64 * 0.2) as u32; // 20% jitter like Go
+                    let adjusted_wait = if jitter > 0 {
+                        wait_ms + rng.gen_range(0..jitter) - jitter / 2
+                    } else {
+                        wait_ms
+                    };
+                    
+                    if adjusted_wait > 0 {
+                        tokio::select! {
+                            _ = sleep(Duration::from_millis(adjusted_wait as u64)) => {}
+                            _ = stop_rx.recv() => break,
+                            _ = stop_flag.notified() => break,
+                        }
+                    }
+                }
+            }
+        });
+
+        handles.push(handle);
+    }
+
+    // Wait for shutdown signal
+    let _ = stop_flag.notified().await;
+    
+    // When shutdown is triggered, enter draining phase
+    shutdown_phase.store(ShutdownPhase::Draining as u32, Ordering::SeqCst);
+    is_stopping.store(true, Ordering::SeqCst);
+    
+    // Notify all workers
+    print("[DAEMON] RAW TCP MODE: Received signal to notify all workers to stop...", true);
+    for _ in 0..10 {
+        stop_flag.notify_waiters();
+    }
+    
+    // Cancel resource monitor
+    print("[DAEMON] Received signal to stop resource monitor...", true);
+    resource_monitor_handle.abort();
+    
+    // Wait for workers to complete with short timeout
+    let max_wait = Duration::from_secs(2);
+    let _ = tokio::time::timeout(max_wait, future::join_all(handles)).await;
+
+    // Final cleanup
+    print("RAW TCP MODE: Received signal to perform final cleanup...", true);
+    shutdown_phase.store(ShutdownPhase::Stopped as u32, Ordering::SeqCst);
+
+    // Force aggressive resource cleanup
+    drop(client);
+    let _ = log_tx.send(daemon_json("update", "Performing aggressive memory cleanup..."));
+    force_cleanup();
+
+    // Get final stats
+    let final_stats = stats.to_test_stats();
+
+    let final_stats_json = serde_json::json!({
+        "event": "http_tester_stopped",
+        "sent": final_stats.sent,
+        "success": final_stats.success,
+        "errors": final_stats.errors,
+        "timeouts": final_stats.timeouts,
+        "conn_errors": final_stats.conn_errors
+    });
+    let _ = log_tx.send(final_stats_json.to_string());
+
+    final_stats
+}
+
+// Helper function for forced cleanup
+fn force_cleanup() {
+    use std::alloc::GlobalAlloc;
+    print("Forcing cleanup...", true);
+    unsafe {
+        std::alloc::System.alloc_zeroed(std::alloc::Layout::new::<u8>());
+    }
+}
+
+// Improved stop_job with instant termination
+pub fn stop_job(app_state: &AppState, id: &str) -> bool {
+    let mut jobs = app_state.jobs.lock().unwrap();
+
+    if let Some(job) = jobs.get_mut(id) {
+        job.status = JobStatus::Stopping;
+
+        // FIRST: Create stop files immediately
+        create_stop_files();
+
+        // SECOND: Log instant termination
+        let log_channels = app_state.log_channels.lock().unwrap();
+        if let Some(log_tx) = log_channels.get(id) {
+            let _ = log_tx.send(daemon_json("update", "Forcibly terminating all workers"));
+        }
+        drop(log_channels);
+
+        // THIRD: Broadcast stop signal to all channels
+        print(&format!("Forcibly terminating all workers for job {}", id), true);
+        {
+            let stop_channels = app_state.stop_channels.lock().unwrap();
+            if let Some(stop_tx) = stop_channels.get(id) {
+                // Send multiple stop signals to ensure delivery
+                for _ in 0..5 {
+                    let _ = stop_tx.send("STOP_IMMEDIATELY".to_string());
+                }
+            }
+        }
+
+        // FOURTH: Abort the task immediately
+        print(&format!("Forcibly terminating all workers for job {}", id), true);
+        {
+            let mut job_tasks = app_state.job_tasks.lock().unwrap();
+            if let Some(handle) = job_tasks.remove(id) {
+                handle.abort();
+            }
+        }
+
+        true
+    } else {
+        false
+    }
+}
+
+// Create stop files to signal shutdown
+pub fn create_stop_files() {
+    let stop_files = &[
+        ".stop-runner",
+        ".stop",
+        "data/.stop",
+    ];
+
+    for &path in stop_files {
+        if let Ok(mut file) = File::create(path) {
+            let _ = file.write_all(b"stop");
+        }
+    }
+
+    // Try temp directory
+    if let Some(tmp_dir) = std::env::temp_dir().to_str() {
+        let tmp_path = format!("{}/enidu.stop", tmp_dir);
+        if let Ok(mut file) = File::create(tmp_path) {
+            let _ = file.write_all(b"stop");
+        }
+    }
+}
+
+// Remove all stop files
+pub fn remove_stop_files() {
+    let stop_files = &[
+        ".stop-runner",
+        ".stop",
+        "data/.stop",
+    ];
+
+    for &path in stop_files {
+        let _ = std::fs::remove_file(path);
+    }
+
+    // Try temp directory
+    if let Some(tmp_dir) = std::env::temp_dir().to_str() {
+        let tmp_path = format!("{}/enidu.stop", tmp_dir);
+        let _ = std::fs::remove_file(tmp_path);
+    }
+}
+
+pub async fn handle_job(
+    app_state: Arc<AppState>,
+    job_info: JobInfo,
+) {
+    let id = job_info.id.clone();
+    let id_for_task = id.clone();
+
+    // Get broadcast channels from app state
+    let log_tx = {
+        let log_channels = app_state.log_channels.lock().unwrap();
+        log_channels.get(&id).cloned().unwrap()
+    };
+    let stop_tx = {
+        let stop_channels = app_state.stop_channels.lock().unwrap();
+        stop_channels.get(&id).cloned().unwrap()
+    };
+    let stop_rx = stop_tx.subscribe();
+
+    // Clone app_state for use after the async block
+    let app_state_clone = app_state.clone();
+
+    // Run the HTTP tester in a separate task
+    let handle = tokio::spawn(async move {
+        // Remove any existing stop files
+        remove_stop_files();
+
+        // Run the tester
+        let message = format!(
+            "Starting HTTP tester with URL: {}, Proxy: {:?}, Concurrency: {}, Timeout: {}s, Wait: {}ms, Random Headers: {}",
+            job_info.url,
+            job_info.proxy_addr,
+            job_info.concurrency,
+            job_info.timeout_sec,
+            job_info.wait_ms,
+            job_info.random_headers
+        );
+        print(&message, false);
+        let stats = http_tester(
+            job_info.url,
+            job_info.proxy_addr,
+            job_info.concurrency,
+            job_info.timeout_sec,
+            job_info.wait_ms,
+            job_info.random_headers,
+            log_tx.clone(),
+            stop_rx,
+        ).await;
+
+        // Update job status when complete
+        let mut jobs = app_state.jobs.lock().unwrap();
+        if let Some(job) = jobs.get_mut(&id_for_task) {
+            job.status = JobStatus::Complete;
+        }
+
+        // Log completion
+        let final_stats_json = serde_json::json!({
+            "event": "job_complete",
+            "job_id": id_for_task,
+            "sent": stats.sent,
+            "success": stats.success,
+            "errors": stats.errors
+        });
+        let _ = log_tx.send(final_stats_json.to_string());
+
+        // Remove from job_tasks
+        {
+            let mut job_tasks = app_state.job_tasks.lock().unwrap();
+            job_tasks.remove(&id_for_task);
+        }
+    });
+
+    // Store the job task handle
+    {
+        let mut job_tasks = app_state_clone.job_tasks.lock().unwrap();
+        job_tasks.insert(id, handle);
+    }
+}

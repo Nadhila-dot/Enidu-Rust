@@ -1,1160 +1,725 @@
-use futures::future;
-use futures::future::join_all;
-use rand::Rng;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::Write;
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
-use std::time::Instant;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::sync::broadcast;
-use tokio::sync::mpsc;
-use tokio::time::sleep;
-use tokio_rustls::{rustls, TlsConnector};
-use reqwest::{Client, ClientBuilder};
-use rustls::{
-    ClientConfig, RootCertStore, DigitallySignedStruct, SignatureScheme
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant},
 };
-use rustls::pki_types::{ServerName, CertificateDer, UnixTime};
-use rustls::client::danger::{ServerCertVerified, HandshakeSignatureValid};
-use std::fmt::Debug;
-//@rs-ignore
-use rand::thread_rng;
+use futures_util::future::join_all;
+use rand::seq::SliceRandom;
 
-use rand::SeedableRng;
-use rand::rngs::StdRng;
+use reqwest::{
+    header::{HeaderMap, HeaderName, HeaderValue, USER_AGENT},
+    Client, Method, RequestBuilder,
+};
+use tokio::{
+    fs::File,
+    io::AsyncWriteExt,
+    sync::{broadcast, mpsc, Semaphore},
+    task::JoinHandle,
+    time::{self, sleep},
+};
+use rand::{Rng};
+use rand_distr::{Distribution, Poisson, Uniform};
+use crate::{
+    libs::logs::print,
+    types::{AppState, JobInfo, JobStatus},
+};
 
-use crate::connect::json::daemon_json;
-use crate::libs::logs::print;
-use crate::types::{AppState, JobInfo, JobStatus};
-use crate::env::container::get_system_stats;
-use url::Url;
-use bytes::BytesMut;
+// Constants for benchmarking
+const STATS_UPDATE_INTERVAL_MS: u64 = 250;
+const BUFFER_POOL_SIZE: usize = 1024;
+const BUFFER_SIZE: usize = 16 * 1024; // 16KB buffers
+const MAX_RETRIES: u32 = 3;
+const HTTP_PIPELINE_DEPTH: usize = 16;
 
-// Shutdown phases for controlled resource reduction
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShutdownPhase {
+// Job state
+#[derive(Debug, Clone, PartialEq)]
+enum JobState {
     Running,
     ShuttingDown,
     Draining,
     Stopped,
 }
 
-// Statistics structure to track results
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct TestStats {
-    pub sent: i64,
-    pub success: i64,
-    pub errors: i64,
-    pub timeouts: i64,
-    pub conn_errors: i64,
+// Statistics for performance tracking
+struct JobStats {
+    start_time: Instant,
+    requests: AtomicU64,
+    successes: AtomicU64,
+    errors: AtomicU64,
+    timeouts: AtomicU64,
+    conn_errors: AtomicU64,
+    bytes_sent: AtomicU64,
+    bytes_received: AtomicU64,
+    last_rps: AtomicU64,
+    
+    // EWMA for smoothed metrics
+    latency_ewma: Mutex<f64>,
+    rps_ewma: Mutex<f64>,
+    
+    // Latency tracking
+    latency_min: AtomicU64,
+    latency_max: AtomicU64,
+    latency_sum: AtomicU64,
 }
 
-// System resource info for auto-scaling
-#[derive(Debug, Clone)]
-struct SystemResources {
-    cpu_usage: f32,
-    memory_available: u64,
-    total_memory: u64,
-}
-
-// Type alias for a boxed stream that implements AsyncRead + AsyncWrite + Send + Unpin
-trait AsyncReadWrite: AsyncRead + AsyncWrite {}
-impl<T: AsyncRead + AsyncWrite + ?Sized> AsyncReadWrite for T {}
-
-type DynStream = Box<dyn AsyncReadWrite + Send + Unpin>;
-
-// Full user agents list for better randomization
-static USER_AGENTS: &[&str] = &[
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/117.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36 Edg/115.0.1901.203",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like creepercloud.io) Version/16.6 Mobile/15E148 Safari/604.1",
-];
-
-// Random referer URLs
-static REFERERS: &[&str] = &[
-    "https://www.google.com/",
-    "https://www.facebook.com/",
-    "https://www.twitter.com/",
-    "https://www.instagram.com/",
-    "https://www.reddit.com/",
-    "https://www.linkedin.com/",
-    "https://www.youtube.com/",
-    "https://www.amazon.com/",
-    "https://www.netflix.com/",
-];
-
-// Random accept language headers
-static ACCEPT_LANGUAGES: &[&str] = &[
-    "en-US,en;q=0.9",
-    "en-GB,en;q=0.9",
-    "en-CA,en;q=0.9",
-    "en-AU,en;q=0.9",
-    "fr-FR,fr;q=0.9,en;q=0.8",
-    "es-ES,es;q=0.9,en;q=0.8",
-    "de-DE,de;q=0.9,en;q=0.8",
-    "ja-JP,ja;q=0.9,en;q=0.8",
-    "zh-CN,zh;q=0.9,en;q=0.8",
-];
-
-// Global atomic counters for stats tracking
-struct AtomicStats {
-    sent: AtomicI64,
-    success: AtomicI64,
-    errors: AtomicI64,
-    timeouts: AtomicI64,
-    conn_errors: AtomicI64,
-}
-
-impl AtomicStats {
+impl JobStats {
     fn new() -> Self {
         Self {
-            sent: AtomicI64::new(0),
-            success: AtomicI64::new(0),
-            errors: AtomicI64::new(0),
-            timeouts: AtomicI64::new(0),
-            conn_errors: AtomicI64::new(0),
+            start_time: Instant::now(),
+            requests: AtomicU64::new(0),
+            successes: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+            timeouts: AtomicU64::new(0),
+            conn_errors: AtomicU64::new(0),
+            bytes_sent: AtomicU64::new(0),
+            bytes_received: AtomicU64::new(0),
+            last_rps: AtomicU64::new(0),
+            latency_ewma: Mutex::new(0.0),
+            rps_ewma: Mutex::new(0.0),
+            latency_min: AtomicU64::new(u64::MAX),
+            latency_max: AtomicU64::new(0),
+            latency_sum: AtomicU64::new(0),
         }
     }
 
-    fn to_test_stats(&self) -> TestStats {
-        TestStats {
-            sent: self.sent.load(Ordering::Relaxed),
-            success: self.success.load(Ordering::Relaxed),
-            errors: self.errors.load(Ordering::Relaxed),
-            timeouts: self.timeouts.load(Ordering::Relaxed),
-            conn_errors: self.conn_errors.load(Ordering::Relaxed),
-        }
-    }
-}
-
-impl Default for AtomicStats {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// REMOVE old DummyCertVerifier block and REPLACE with:
-#[derive(Debug)]
-struct NoVerify;
-
-impl rustls::client::danger::ServerCertVerifier for NoVerify {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ED25519,
-            SignatureScheme::RSA_PKCS1_SHA256,
-        ]
-    }
-}
-
-// NEW: Raw HTTP Client for high-performance requests
-#[derive(Clone)]
-pub struct RawHttpClient {
-    timeout: Duration,
-    connect_timeout: Duration,
-    pool: Arc<ConnectionPool>,
-    tls_connector: Arc<TlsConnector>,
-    proxy_addr: Option<String>,
-}
-
-impl RawHttpClient {
-    pub fn builder() -> RawHttpClientBuilder {
-        RawHttpClientBuilder::new()
-    }
-
-    // Send raw HTTP GET request
-    pub async fn get(&self, url: &str) -> Result<RawHttpResponse, std::io::Error> {
-        let headers = HashMap::new();
-        self.send_request(url, "GET", headers).await
-    }
-
-    // Send request with method and headers
-    pub async fn send_request(
-        &self,
-        url: &str,
-        method: &str,
-        headers: HashMap<String, String>
-    ) -> Result<RawHttpResponse, std::io::Error> {
-        let parsed_url = Url::parse(url)
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid URL"))?;
-
-        let host = parsed_url.host_str().unwrap_or("localhost");
-        let port = parsed_url.port().unwrap_or(if parsed_url.scheme() == "https" { 443 } else { 80 });
-        let use_tls = parsed_url.scheme() == "https";
-
-        let mut stream = self.pool.get_connection(host, port, use_tls, &self.tls_connector, self.connect_timeout).await?;
-
-        // Build path + query (Url has no path_and_query())
-        let mut path = parsed_url.path().to_string();
-        if path.is_empty() {
-            path = "/".to_string();
-        }
-        if let Some(q) = parsed_url.query() {
-            path.push('?');
-            path.push_str(q);
-        }
-
-        let mut request = format!("{} {} HTTP/1.1\r\n", method, path);
-        request.push_str(&format!("Host: {}\r\n", host));
-        request.push_str("Connection: keep-alive\r\n");
-        for (k, v) in headers {
-            request.push_str(&format!("{}: {}\r\n", k, v));
-        }
-        request.push_str("\r\n");
-        stream.write_all(request.as_bytes()).await?;
-
-        let read_timeout = self.timeout;
-        let mut response = String::new();
-        let read_result = tokio::time::timeout(read_timeout, async {
-            let mut buf = [0u8; 4096];
-            loop {
-                let n = stream.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                if let Ok(s) = std::str::from_utf8(&buf[..n]) {
-                    response.push_str(s);
-                    if response.contains("\r\n\r\n") {
-                        // simple break after headers+body start (optional)
-                    }
-                }
+    fn update_latency(&self, latency_ms: u64) {
+        // Update min/max latency with atomic compare-and-swap
+        let mut current_min = self.latency_min.load(Ordering::Relaxed);
+        while latency_ms < current_min {
+            match self.latency_min.compare_exchange_weak(
+                current_min,
+                latency_ms,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current_min = actual,
             }
-            Ok::<(), std::io::Error>(())
-        }).await;
+        }
 
-        match read_result {
-            Ok(Ok(_)) => {
-                self.pool.return_connection(host, port, use_tls, stream).await;
-                let status_code = response
-                    .lines()
-                    .next()
-                    .and_then(|l| l.split_whitespace().nth(1))
-                    .and_then(|code| code.parse::<u16>().ok())
-                    .unwrap_or(0);
-                Ok(RawHttpResponse { status: status_code, body: response })
+        let mut current_max = self.latency_max.load(Ordering::Relaxed);
+        while latency_ms > current_max {
+            match self.latency_max.compare_exchange_weak(
+                current_max,
+                latency_ms,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current_max = actual,
             }
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Request timed out")),
+        }
+
+        // Update sum for average calculation
+        self.latency_sum.fetch_add(latency_ms, Ordering::Relaxed);
+
+        // Update EWMA (Exponentially Weighted Moving Average) with 0.1 alpha
+        let alpha = 0.1;
+        let mut ewma = self.latency_ewma.lock().unwrap();
+        if *ewma == 0.0 {
+            *ewma = latency_ms as f64;
+        } else {
+            *ewma = alpha * (latency_ms as f64) + (1.0 - alpha) * *ewma;
         }
     }
-}
 
-// Response type
-pub struct RawHttpResponse {
-    pub status: u16,
-    pub body: String,
-}
-
-impl RawHttpResponse {
-    pub fn is_success(&self) -> bool {
-        self.status >= 200 && self.status < 300
-    }
-}
-
-// Builder for RawHttpClient
-pub struct RawHttpClientBuilder {
-    timeout: Duration,
-    connect_timeout: Duration,
-    pool_idle_timeout: Duration,
-    danger_accept_invalid_certs: bool,
-    proxy_addr: Option<String>,
-}
-
-impl RawHttpClientBuilder {
-    pub fn new() -> Self {
-        Self {
-            timeout: Duration::from_secs(1),          // safer default
-            connect_timeout: Duration::from_millis(300),
-            pool_idle_timeout: Duration::from_secs(60),
-            danger_accept_invalid_certs: true,
-            proxy_addr: None,
-        }
-    }
-    
-    pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self
-    }
-    
-    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
-        self.connect_timeout = timeout;
-        self
-    }
-    
-    pub fn pool_idle_timeout(mut self, timeout: Duration) -> Self {
-        self.pool_idle_timeout = timeout;
-        self
-    }
-    
-    pub fn danger_accept_invalid_certs(mut self, accept: bool) -> Self {
-        self.danger_accept_invalid_certs = accept;
-        self
-    }
-    
-    pub fn proxy(mut self, proxy_addr: &str) -> Self {
-        self.proxy_addr = Some(proxy_addr.to_string());
-        self
-    }
-    
-    pub fn build(self) -> Result<RawHttpClient, std::io::Error> {
-        let mut root_store = RootCertStore::empty();
-        // Updated for rustls 0.23+ API - Use add_server_trust_anchors for webpki-roots
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    fn update_rps(&self, rps: u64) {
+        self.last_rps.store(rps, Ordering::Relaxed);
         
-        let mut config = ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-
-        if self.danger_accept_invalid_certs {
-            config.dangerous().set_certificate_verifier(Arc::new(NoVerify));
-        }
-
-        let tls_connector = TlsConnector::from(Arc::new(config));
-        Ok(RawHttpClient {
-            timeout: self.timeout,
-            connect_timeout: self.connect_timeout,
-            pool: Arc::new(ConnectionPool::new(self.pool_idle_timeout)),
-            tls_connector: Arc::new(tls_connector),
-            proxy_addr: self.proxy_addr,
-        })
-    }
-}
-
-// REPLACEMENT: More aggressive connection pooling implementation
-pub struct ConnectionPool {
-    pools: dashmap::DashMap<String, tokio::sync::Mutex<Vec<DynStream>>>,
-    idle_timeout: Duration,
-    // Track pool metrics
-    total_connections: AtomicU32,
-    max_connections_per_host: usize,
-}
-
-impl ConnectionPool {
-    fn new(idle_timeout: Duration) -> Self {
-        Self {
-            pools: dashmap::DashMap::new(),
-            idle_timeout,
-            total_connections: AtomicU32::new(0),
-            // Massively increase connection pool size (similar to Go's 5,000,000)
-            max_connections_per_host: 5_000_000,
+        // Update EWMA for RPS
+        let alpha = 0.1;
+        let mut ewma = self.rps_ewma.lock().unwrap();
+        if *ewma == 0.0 {
+            *ewma = rps as f64;
+        } else {
+            *ewma = alpha * (rps as f64) + (1.0 - alpha) * *ewma;
         }
     }
-    
-    async fn get_connection(
-        &self,
-        host: &str,
-        port: u16,
-        use_tls: bool,
-        tls_connector: &TlsConnector,
-        connect_timeout: Duration,
-    ) -> Result<DynStream, std::io::Error> {
-        let key = format!("{}:{}:{}", host, port, use_tls);
-        if let Some(pool_entry) = self.pools.get(&key) {
-            let mut pool = pool_entry.lock().await;
-            if let Some(conn) = pool.pop() {
-                return Ok(conn);
-            }
-        }
 
-        // Apply connect timeout
-        let tcp_stream = match tokio::time::timeout(connect_timeout, TcpStream::connect((host, port))).await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout")),
+    fn get_stats_json(&self) -> serde_json::Value {
+        let elapsed_secs = self.start_time.elapsed().as_secs_f64();
+        let requests = self.requests.load(Ordering::Relaxed);
+        let successes = self.successes.load(Ordering::Relaxed);
+        let errors = self.errors.load(Ordering::Relaxed);
+        let timeouts = self.timeouts.load(Ordering::Relaxed);
+        let conn_errors = self.conn_errors.load(Ordering::Relaxed);
+        
+        let avg_rps = if elapsed_secs > 0.0 {
+            (requests as f64) / elapsed_secs
+        } else {
+            0.0
         };
-
-        tcp_stream.set_nodelay(true)?;
-
-        match tcp_stream.into_std() {
-            Ok(std_stream) => {
-                let socket = socket2::Socket::from(std_stream);
-                let _ = socket.set_reuse_address(true);
-                let _ = socket.set_recv_buffer_size(1_048_576);
-                let _ = socket.set_send_buffer_size(1_048_576);
-                let std_stream = socket.into();
-                let tcp_stream = TcpStream::from_std(std_stream)?;
-                self.total_connections.fetch_add(1, Ordering::Relaxed);
-
-                if use_tls {
-                    let domain = ServerName::try_from(host.to_string())
-                        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid hostname"))?;
-                    let tls = tls_connector.connect(domain, tcp_stream).await
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-                    Ok(Box::new(tls))
-                } else {
-                    Ok(Box::new(tcp_stream))
-                }
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    async fn return_connection(
-        &self,
-        host: &str,
-        port: u16,
-        use_tls: bool,
-        conn: DynStream,
-    ) {
-        let key = format!("{}:{}:{}", host, port, use_tls);
-        let entry = self.pools.entry(key).or_insert_with(|| tokio::sync::Mutex::new(Vec::new()));
-        let mut pool = entry.lock().await;
         
-        // Keep much more connections in the pool, similar to Go version
-        if pool.len() < self.max_connections_per_host {
-            pool.push(conn);
-        }
-    }
-    
-    // Get pool stats for monitoring
-    fn get_stats(&self) -> (u32, usize) {
-        let total = self.total_connections.load(Ordering::Relaxed);
-        let active_hosts = self.pools.len();
-        (total, active_hosts)
-    }
-}
-
-// Add a request template builder similar to Go version
-struct RequestTemplate {
-    method: String,
-    path: String,
-    host: String,
-    scheme: String,
-    port: u16,
-    use_tls: bool,
-    base_headers: HashMap<String, String>,
-}
-
-impl RequestTemplate {
-    fn new(method: &str, url: &str) -> Result<Self, std::io::Error> {
-        let parsed_url = Url::parse(url)
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid URL"))?;
-
-        let scheme = parsed_url.scheme().to_string();
-        let host = parsed_url.host_str().unwrap_or("localhost").to_string();
-
-        let mut path = parsed_url.path().to_string();
-        if path.is_empty() {
-            path = "/".to_string();
-        }
-        if let Some(q) = parsed_url.query() {
-            path.push('?');
-            path.push_str(q);
-        }
-
-        let port = parsed_url.port().unwrap_or(if scheme == "https" { 443 } else { 80 });
-        let use_tls = scheme == "https";
-
-        let mut base_headers = HashMap::new();
-        base_headers.insert("Host".to_string(), host.clone());
-        base_headers.insert("Connection".to_string(), "keep-alive".to_string());
-        base_headers.insert("Accept".to_string(), "*/*".to_string());
-
-        Ok(Self {
-            method: method.to_string(),
-            path,
-            host,
-            scheme,
-            port,
-            use_tls,
-            base_headers,
+        let latency_min = self.latency_min.load(Ordering::Relaxed);
+        let latency_max = self.latency_max.load(Ordering::Relaxed);
+        let latency_sum = self.latency_sum.load(Ordering::Relaxed);
+        let latency_avg = if requests > 0 {
+            (latency_sum as f64) / (requests as f64)
+        } else {
+            0.0
+        };
+        
+        let ewma_latency = *self.latency_ewma.lock().unwrap();
+        let ewma_rps = *self.rps_ewma.lock().unwrap();
+        
+        serde_json::json!({
+            "elapsed_secs": elapsed_secs,
+            "requests": {
+                "total": requests,
+                "successes": successes,
+                "errors": errors,
+                "timeouts": timeouts,
+                "conn_errors": conn_errors,
+            },
+            "throughput": {
+                "current_rps": self.last_rps.load(Ordering::Relaxed),
+                "avg_rps": avg_rps,
+                "ewma_rps": ewma_rps,
+            },
+            "latency_ms": {
+                "min": if latency_min == u64::MAX { 0 } else { latency_min },
+                "max": latency_max,
+                "avg": latency_avg,
+                "ewma": ewma_latency,
+            },
+            "transfer": {
+                "bytes_sent": self.bytes_sent.load(Ordering::Relaxed),
+                "bytes_received": self.bytes_received.load(Ordering::Relaxed),
+            }
         })
     }
-
-    fn build_request(&self, additional: HashMap<String, String>) -> String {
-        let mut request = format!("{} {} HTTP/1.1\r\n", self.method, self.path);
-        for (k, v) in &self.base_headers {
-            request.push_str(&format!("{}: {}\r\n", k, v));
-        }
-        for (k, v) in additional {
-            request.push_str(&format!("{}: {}\r\n", k, v));
-        }
-        request.push_str("\r\n");
-        request
-    }
 }
 
-// Enhance RawHttpClient with retry logic and request templates
-impl RawHttpClient {
-    // Send request with retry logic (similar to Go version)
-    pub async fn send_request_with_retry(
-        &self,
-        url: &str,
-        method: &str,
-        headers: HashMap<String, String>,
-        max_retries: usize,
-    ) -> Result<RawHttpResponse, std::io::Error> {
-        let mut rng = rand::thread_rng();
-        let backoff_base = Duration::from_millis(50);
-        
-        // Create request template for reuse
-        let template = RequestTemplate::new(method, url)?;
-        
-        for retry in 0..=max_retries {
-            // Check shutdown flag if we're in worker context
-            let should_interrupt = CURRENT_SHUTDOWN_PHASE.with(|cell| {
-                if let Some(phase) = *cell.borrow() {
-                    phase >= ShutdownPhase::Draining as u32
-                } else {
-                    false
-                }
-            });
-            if should_interrupt {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted, 
-                    "Operation interrupted due to shutdown"
-                ));
-            }
-            
-            let result = self.send_request_with_template(&template, headers.clone()).await;
-            
-            match &result {
-                Ok(response) if response.is_success() => return result,
-                Ok(_) => {
-                    // Non-2xx response, might retry depending on status
-                    if retry == max_retries {
-                        return result;
-                    }
-                },
-                Err(e) if is_connection_error(e) => {
-                    if retry == max_retries {
-                        return result;
-                    }
-                    
-                    // Apply exponential backoff with jitter
-                    let backoff = backoff_base * 2u32.pow(retry as u32);
-                    let jitter = Duration::from_millis(rng.gen_range(0..backoff.as_millis() as u64 / 2));
-                    tokio::time::sleep(backoff + jitter).await;
-                },
-                _ => return result, // Other errors are not retryable
-            }
+// User-Agent generators
+const USER_AGENTS: &[&str] = &[
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.1 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:94.0) Gecko/20100101 Firefox/94.0",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 15_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.1 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.104 Mobile Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36",
+    "Mozilla/5.0 (iPad; CPU OS 15_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.1 Mobile/15E148 Safari/604.1",
+];
+
+const ACCEPT_LANGUAGES: &[&str] = &[
+    "en-US,en;q=0.9", "en-GB,en;q=0.8", "de-DE,de;q=0.9,en;q=0.8", 
+    "fr-FR,fr;q=0.9,en;q=0.8", "ja-JP,ja;q=0.9,en;q=0.8", "es-ES,es;q=0.9",
+    "zh-CN,zh;q=0.9,en;q=0.8", "ru-RU,ru;q=0.9,en;q=0.8",
+];
+
+const REFERRERS: &[&str] = &[
+    "https://www.google.com/", "https://www.bing.com/", "https://duckduckgo.com/", 
+    "https://www.facebook.com/", "https://twitter.com/", "https://www.linkedin.com/",
+    "https://www.reddit.com/", "https://news.ycombinator.com/",
+];
+
+// BufferPool for efficient memory reuse
+struct BufferPool {
+    pool: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+impl BufferPool {
+    fn new(capacity: usize, buffer_size: usize) -> Self {
+        let mut pool = Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            pool.push(vec![0; buffer_size]);
         }
         
-        // Should never reach here due to the returns above
-        unreachable!()
-    }
-    
-    // Send request using a pre-built template (more efficient)
-    async fn send_request_with_template(
-        &self,
-        template: &RequestTemplate,
-        headers: HashMap<String, String>,
-    ) -> Result<RawHttpResponse, std::io::Error> {
-        // Get connection with correct scheme/port
-        let mut stream = self.pool
-            .get_connection(&template.host, template.port, template.use_tls, &self.tls_connector, self.connect_timeout)
-            .await?;
-
-        let request = template.build_request(headers);
-        stream.write_all(request.as_bytes()).await?;
-
-        // Faster: read only headers (up to a cap)
-        let read_timeout = self.timeout;
-        let mut buffer = BytesMut::with_capacity(4096);
-        let read_res = tokio::time::timeout(read_timeout, async {
-            let mut tmp = [0u8; 1024];
-            while buffer.len() < 8192 {
-                let n = stream.read(&mut tmp).await?;
-                if n == 0 {
-                    break;
-                }
-                buffer.extend_from_slice(&tmp[..n]);
-                if buffer.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            Ok::<(), std::io::Error>(())
-        }).await;
-
-        match read_res {
-            Ok(Ok(())) => {
-                self.pool.return_connection(&template.host, template.port, template.use_tls, stream).await;
-                let text = String::from_utf8_lossy(&buffer);
-                let status_code = text
-                    .lines()
-                    .next()
-                    .and_then(|l| l.split_whitespace().nth(1))
-                    .and_then(|c| c.parse::<u16>().ok())
-                    .unwrap_or(0);
-                Ok(RawHttpResponse { status: status_code, body: String::new() })
-            }
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "read timeout")),
-        }
-    }
-}
-
-// Helper to check if an error is a connection-related error (like in Go version)
-fn is_connection_error(err: &std::io::Error) -> bool {
-    let error_str = err.to_string().to_lowercase();
-    error_str.contains("connection") || 
-        error_str.contains("reset") || 
-        error_str.contains("broken pipe") || 
-        error_str.contains("eof") || 
-        error_str.contains("i/o timeout")
-}
-
-// Add thread_local for tracking shutdown phase in each worker thread
-thread_local! {
-    static CURRENT_SHUTDOWN_PHASE: std::cell::RefCell<Option<u32>> = std::cell::RefCell::new(None);
-}
-
-// Monitor system resources for auto-scaling
-fn monitor_system_resources() -> SystemResources {
-    let sys = get_system_stats();
-    let mem_available = sys.total_memory() - sys.used_memory();
-    let cpu_usage = 1.0 - (mem_available as f32 / sys.total_memory() as f32);
-    
-    SystemResources {
-        cpu_usage,
-        memory_available: mem_available,
-        total_memory: sys.total_memory(),
-    }
-}
-
-// Read max workers from .env file
-fn get_max_workers_from_env() -> Option<u32> {
-    if let Ok(env_content) = std::fs::read_to_string(".env") {
-        for line in env_content.lines() {
-            if let Some(value) = line.strip_prefix("MAX_WORKERS=") {
-                return value.trim().parse().ok();
-            }
-        }
-    }
-    None
-}
-
-// Dynamic concurrency adjustment based on system resources
-fn adjust_concurrency(
-    semaphore: &tokio::sync::Semaphore, 
-    resources: &SystemResources,
-    target_concurrency: u32,
-    current_rps: u32,
-    target_rps: u32
-) {
-    let current_permits = semaphore.available_permits();
-    
-    // More aggressive memory factor
-    let memory_factor = if resources.memory_available < (resources.total_memory / 10) {
-        2.0
-    } else if resources.memory_available < (resources.total_memory / 5) {
-        0.6
-    } else {
-        1.2 // Actually increase when memory is good
-    };
-    
-    // RPS-based adjustment
-    let rps_factor = if current_rps < target_rps / 2 {
-        1.5 // Boost when RPS is too low
-    } else if current_rps > target_rps {
-        0.9 // Slight reduction when target exceeded
-    } else {
-        1.1 // Slight increase otherwise
-    };
-    
-    let target_permits = (target_concurrency as f32 * memory_factor * rps_factor) as usize;
-    let target_permits = std::cmp::min(target_permits, 50_000_000); // Massive cap
-    
-    let diff = target_permits as isize - current_permits as isize;
-    if diff > 0 {
-        semaphore.add_permits(diff as usize);
-    }
-}
-
-// UPDATED: Raw TCP-based HTTP tester (replaces reqwest-based one)
-pub async fn http_tester(
-    target_url: String,
-    proxy_addr: Option<String>,
-    base_concurrency: u32,
-    timeout_sec: u64,
-    wait_ms: u32,
-    random_headers: bool,
-) -> AtomicStats {
-    
-    // REMOVE ALL ARTIFICIAL LIMITS - GO FULL BEAST MODE
-    let num_cpus = num_cpus::get() as u32;
-    
-    // Match Go's aggressive scaling: 15000 workers per CPU core
-    let workers_per_cpu = 15_000;
-    let total_workers = num_cpus * workers_per_cpu * base_concurrency;
-    
-    println!("🦀 RUST BEAST MODE: Launching {} workers across {} CPUs", total_workers, num_cpus);
-    println!("⚡ Target: {} | Concurrency: {} | Timeout: {}s", target_url, total_workers, timeout_sec);
-    
-    // Create MASSIVE connection pool like Go version
-    let mut client_builder = ClientBuilder::new()
-        .timeout(Duration::from_secs(timeout_sec))
-        .connect_timeout(Duration::from_millis(500))
-        .pool_max_idle_per_host(5_000_000)  // Match Go's massive pool
-        .pool_idle_timeout(Duration::from_secs(90))
-        .tcp_keepalive(Duration::from_secs(60))
-        .tcp_nodelay(true)
-        .http1_only()  // Disable HTTP/2 for maximum simple throughput
-        .danger_accept_invalid_certs(true);
-    
-    if let Some(proxy) = proxy_addr {
-        if let Ok(proxy_url) = reqwest::Proxy::all(&proxy) {
-            client_builder = client_builder.proxy(proxy_url);
+        Self {
+            pool: Arc::new(Mutex::new(pool)),
         }
     }
     
-    let client = Arc::new(client_builder.build().unwrap());
+    fn get_buffer(&self) -> Vec<u8> {
+        let mut pool = self.pool.lock().unwrap();
+        if let Some(buffer) = pool.pop() {
+            buffer
+        } else {
+            // If pool is empty, create new buffer
+            vec![0; BUFFER_SIZE]
+        }
+    }
     
-    // Shared atomic counters
-    let stats = Arc::new(AtomicStats::default());
+    fn return_buffer(&self, mut buffer: Vec<u8>) {
+        // Clear buffer and return to pool
+        buffer.clear();
+        buffer.resize(BUFFER_SIZE, 0);
+        let mut pool = self.pool.lock().unwrap();
+        if pool.len() < BUFFER_POOL_SIZE {
+            pool.push(buffer);
+        }
+        // If pool is full, buffer will be dropped
+    }
+}
+
+// Create stop files to signal job termination
+pub fn create_stop_files(job_id: &str) -> Result<(), std::io::Error> {
+    // Create a directory for stop files if it doesn't exist
+    std::fs::create_dir_all("./stops")?;
+    
+    // Create a stop file with the job ID
+    let path = format!("./stops/{}.stop", job_id);
+    std::fs::write(&path, "STOP")?;
+    
+    print(&format!("Created stop file: {}", path), false);
+    Ok(())
+}
+
+// Stop a running job
+pub fn stop_job(state: &AppState, job_id: &str) {
+    // First update job status to indicate stopping
+    {
+        let mut jobs = state.jobs.lock().unwrap();
+        if let Some(job) = jobs.get_mut(job_id) {
+            job.status = JobStatus::Stopping;
+            print(&format!("Stopping job: {}", job_id), false);
+        } else {
+            print(&format!("Job not found for stopping: {}", job_id), false);
+            return;
+        }
+    }
+    
+    // Create stop file
+    if let Err(e) = create_stop_files(job_id) {
+        print(&format!("Error creating stop file: {}", e), true);
+    }
+    
+    // Send stop signal via channel
+    if let Some(tx) = state.stop_channels.lock().unwrap().get(job_id) {
+        let _ = tx.send(String::from("STOP"));
+    }
+}
+
+// Generate random headers for requests
+fn generate_random_headers(random_headers: bool) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    
+    if !random_headers {
+        // Default basic headers
+        headers.insert(USER_AGENT, HeaderValue::from_static("Enidu-Benchmark/1.0"));
+        return headers;
+    }
+    
+    let mut rng = rand::rng();
+    
+    // Add User-Agent
+    let index = rng.gen_range(0..USER_AGENTS.len());
+    let user_agent = USER_AGENTS[index];
+    headers.insert(USER_AGENT, HeaderValue::from_str(user_agent).unwrap());
+    
+    // Add Accept-Language
+    let index = rng.gen_range(0..ACCEPT_LANGUAGES.len());
+    let accept_lang = ACCEPT_LANGUAGES[index];
+    headers.insert(
+        HeaderName::from_static("accept-language"),
+        HeaderValue::from_str(accept_lang).unwrap(),
+    );
+    
+    // Add Referer with 50% probability
+    if rng.gen_bool(0.5) {
+        let index = rng.gen_range(0..REFERRERS.len());
+        let referer = REFERRERS[index];
+        headers.insert(
+            HeaderName::from_static("referer"),
+            HeaderValue::from_str(referer).unwrap(),
+        );
+    }
+    
+    // Add cache control with 40% probability
+    if rng.gen_bool(0.4) {
+        headers.insert(
+            HeaderName::from_static("cache-control"),
+            HeaderValue::from_static("no-cache"),
+        );
+    }
+    
+    // Add random X-headers with 30% probability
+    if rng.gen_bool(0.3) {
+        headers.insert(
+            HeaderName::from_static("x-requested-with"),
+            HeaderValue::from_static("XMLHttpRequest"),
+        );
+    }
+    
+    headers
+}
+
+// Main job execution function
+pub async fn handle_job(job: JobInfo, log_tx: broadcast::Sender<String>, stop_rx: broadcast::Receiver<String>) {
+    print(&format!("Starting job: {}", job.id), false);
+    
+    // Send initial log message
+    let _ = log_tx.send(format!("🚀 Starting benchmark with {} workers", job.concurrency));
+    
+    // Create shared state for job
+    let stats = Arc::new(JobStats::new());
     let stop_flag = Arc::new(AtomicBool::new(false));
+    let job_state = Arc::new(Mutex::new(JobState::Running));
+    let buffer_pool = Arc::new(BufferPool::new(BUFFER_POOL_SIZE, BUFFER_SIZE));
     
-    // NO SEMAPHORES - NO LIMITS - JUST RAW POWER
-    let mut handles = Vec::with_capacity(total_workers as usize);
+    // Create semaphore to limit concurrency precisely
+    let concurrency_limit = Arc::new(Semaphore::new(job.concurrency as usize));
     
-    // Launch ALL workers immediately - no artificial throttling
-    for worker_id in 0..total_workers {
-        let client = client.clone();
-        let stats = stats.clone();
-        let stop_flag = stop_flag.clone();
-        let url = target_url.clone();
-        
-        let handle = tokio::spawn(async move {
-            let mut rng = StdRng::seed_from_u64(worker_id as u64);
-            let retry_max = 3;
-            let backoff_base = Duration::from_millis(50);
-            
-            loop {
-                // Check stop flag
-                if stop_flag.load(Ordering::Relaxed) {
-                    break;
-                }
-                
-                // Build request with random headers
-                let mut req_builder = client.get(&url);
-                
-                if random_headers {
-                    req_builder = req_builder
-                        .header("User-Agent", USER_AGENTS[rng.gen_range(0..USER_AGENTS.len())])
-                        .header("Referer", REFERERS[rng.gen_range(0..REFERERS.len())])
-                        .header("Cache-Control", "no-cache")
-                        .header("Accept-Language", "en-US,en;q=0.9");
-                }
-                
-                // Retry logic similar to Go version
-                let mut success = false;
-                for retry in 0..retry_max {
-                    if stop_flag.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    
-                    match req_builder.try_clone().unwrap().send().await {
-                        Ok(response) => {
-                            stats.sent.fetch_add(1, Ordering::Relaxed);
-                            if response.status().is_success() {
-                                stats.success.fetch_add(1, Ordering::Relaxed);
-                                success = true;
-                                break;
-                            } else {
-                                stats.errors.fetch_add(1, Ordering::Relaxed);
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            stats.sent.fetch_add(1, Ordering::Relaxed);
-                            
-                            if e.is_timeout() {
-                                stats.timeouts.fetch_add(1, Ordering::Relaxed);
-                            } else if e.is_connect() || e.is_request() {
-                                stats.conn_errors.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                stats.errors.fetch_add(1, Ordering::Relaxed);
-                            }
-                            
-                            // Only retry on connection errors
-                            if !e.is_connect() || retry == retry_max - 1 {
-                                break;
-                            }
-                            
-                            // Exponential backoff with jitter
-                            let backoff = backoff_base * 2u32.pow(retry);
-                            let jitter = Duration::from_millis(rng.gen_range(0..backoff.as_millis() as u64 / 2));
-                            sleep(backoff + jitter).await;
-                        }
-                    }
-                }
-                
-                // Wait between requests (with jitter like Go version)
-                if wait_ms > 0 {
-                    let jitter = (wait_ms as f64 * 0.2) as u64;
-                    let adjusted_wait = wait_ms as i64 + rng.gen_range(-(jitter as i64 / 2)..=(jitter as i64 / 2));
-                    if adjusted_wait > 0 {
-                        sleep(Duration::from_millis(adjusted_wait as u64)).await;
-                    }
-                }
-            }
-        });
-        
-        handles.push(handle);
-    }
+    // Clone job.id before moving job into closures
+    let job_id = job.id.clone();
+    let job_id_for_stop = job_id.clone();
+    let job_id_clone = job_id.clone();
     
-    // Stats printer task
-    let stats_clone = stats.clone();
-    let stop_flag_clone = stop_flag.clone();
-    let stats_handle = tokio::spawn(async move {
-        let start_time = Instant::now();
-        let mut last_sent = 0;
-        let mut last_success = 0;
-        let mut last_errors = 0;
-        
-        while !stop_flag_clone.load(Ordering::Relaxed) {
-            let current_sent = stats_clone.sent.load(Ordering::Relaxed);
-            let current_success = stats_clone.success.load(Ordering::Relaxed);
-            let current_errors = stats_clone.errors.load(Ordering::Relaxed);
-            let current_timeouts = stats_clone.timeouts.load(Ordering::Relaxed);
-            let current_conn_errors = stats_clone.conn_errors.load(Ordering::Relaxed);
-            
-            let duration = start_time.elapsed().as_secs_f64();
-            let overall_rps = current_sent as f64 / duration;
-            let current_rps = current_sent - last_sent;
-            let success_rps = current_success - last_success;
-            let error_rps = current_errors - last_errors;
-            
-            print!("\rRuntime: {:.1}s | Reqs: {} (RPS: {} | Avg: {:.1}) | Success: {} ({}/s) | Errors: {} ({}/s) | Timeouts: {} | ConnErrs: {}",
-                duration,
-                current_sent, current_rps, overall_rps,
-                current_success, success_rps,
-                current_errors, error_rps,
-                current_timeouts, current_conn_errors
-            );
-            
-            last_sent = current_sent;
-            last_success = current_success;
-            last_errors = current_errors;
-            
-            sleep(Duration::from_secs(1)).await;
-        }
-    });
-    
-    // Wait for stop signal (you'll need to implement this based on your stop mechanism)
-    // For now, let's run for a demo period or until manual stop
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            println!("\n🛑 Interrupt signal detected, stopping all workers...");
-        }
-        _ = sleep(Duration::from_secs(300)) => {
-            println!("\n⏰ Demo timeout reached, stopping...");
-        }
-    }
-    
-    // Signal all workers to stop
-    stop_flag.store(true, Ordering::SeqCst);
-    
-    // Wait for all workers to finish
-    let _ = join_all(handles).await;
-    stats_handle.abort();
-    
-    println!("\n💥 RUST BEAST MODE completed!");
-    
-    // Return final stats
-    AtomicStats {
-        sent: AtomicI64::new(stats.sent.load(Ordering::Relaxed)),
-        success: AtomicI64::new(stats.success.load(Ordering::Relaxed)),
-        errors: AtomicI64::new(stats.errors.load(Ordering::Relaxed)),
-        timeouts: AtomicI64::new(stats.timeouts.load(Ordering::Relaxed)),
-        conn_errors: AtomicI64::new(stats.conn_errors.load(Ordering::Relaxed)),
-    }
-}
-
-// Helper function to remove all the conservative resource management
-pub async fn unleashed_worker_spawn(
-    client: Arc<Client>,
-    url: String,
-    stats: Arc<AtomicStats>,
-    stop_flag: Arc<AtomicBool>,
-    wait_ms: u32,
-    random_headers: bool,
-) {
-    let mut rng = StdRng::from_rng(&mut thread_rng());
-    
-    loop {
-        if stop_flag.load(Ordering::Relaxed) {
-            break;
-        }
-        
-        // Build request
-        let mut req_builder = client.get(&url);
-        
-        if random_headers {
-            req_builder = req_builder
-                .header("User-Agent", USER_AGENTS[rng.gen_range(0..USER_AGENTS.len())])
-                .header("Referer", REFERERS[rng.gen_range(0..REFERERS.len())])
-                .header("Cache-Control", "no-cache");
-        }
-        
-        // Fire and forget - no retry logic to maximize speed
-        match req_builder.send().await {
-            Ok(response) => {
-                stats.sent.fetch_add(1, Ordering::Relaxed);
-                if response.status().is_success() {
-                    stats.success.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    stats.errors.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            Err(e) => {
-                stats.sent.fetch_add(1, Ordering::Relaxed);
-                if e.is_timeout() {
-                    stats.timeouts.fetch_add(1, Ordering::Relaxed);
-                } else if e.is_connect() {
-                    stats.conn_errors.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    stats.errors.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-        
-        // Minimal wait with jitter
-        if wait_ms > 0 {
-            let jitter = rng.gen_range(0..wait_ms / 2);
-            sleep(Duration::from_millis((wait_ms + jitter) as u64)).await;
-        }
-    }
-}
-
-// Helper function for forced cleanup
-fn force_cleanup() {
-    use std::alloc::GlobalAlloc;
-    print("Forcing cleanup...", true);
-    unsafe {
-        std::alloc::System.alloc_zeroed(std::alloc::Layout::new::<u8>());
-    }
-}
-
-// Improved stop_job with instant termination
-pub fn stop_job(app_state: &AppState, id: &str) -> bool {
-    let mut jobs = app_state.jobs.lock().unwrap();
-
-    if let Some(job) = jobs.get_mut(id) {
-        job.status = JobStatus::Stopping;
-
-        // FIRST: Create stop files immediately
-        create_stop_files();
-
-        // SECOND: Log instant termination
-        let log_channels = app_state.log_channels.lock().unwrap();
-        if let Some(log_tx) = log_channels.get(id) {
-            let _ = log_tx.send(daemon_json("update", "Forcibly terminating all workers"));
-        }
-        drop(log_channels);
-
-        // THIRD: Broadcast stop signal to all channels
-        print(&format!("Forcibly terminating all workers for job {}", id), true);
-        {
-            let stop_channels = app_state.stop_channels.lock().unwrap();
-            if let Some(stop_tx) = stop_channels.get(id) {
-                // Send multiple stop signals to ensure delivery
-                for _ in 0..5 {
-                    let _ = stop_tx.send("STOP_IMMEDIATELY".to_string());
-                }
-            }
-        }
-
-        // FOURTH: Abort the task immediately
-        print(&format!("Forcibly terminating all workers for job {}", id), true);
-        {
-            let mut job_tasks = app_state.job_tasks.lock().unwrap();
-            if let Some(handle) = job_tasks.remove(id) {
-                handle.abort();
-            }
-        }
-
-        true
-    } else {
-        false
-    }
-}
-
-// Create stop files to signal shutdown
-// Simple async file watcher for stop files
-pub fn create_stop_file_watcher() -> tokio::sync::mpsc::Receiver<()> {
-    use std::path::PathBuf;
-    use tokio::sync::mpsc;
-    use tokio::time::{sleep, Duration};
-
-    let (tx, rx) = mpsc::channel(1);
-    let stop_files = vec![
-        PathBuf::from(".stop-runner"),
-        PathBuf::from(".stop"),
-        PathBuf::from("data/.stop"),
-        std::env::temp_dir().join("enidu.stop"),
-    ];
-
-    // Spawn a background watcher task
+    // Create a stop file watcher
+    let stop_file_path = format!("./stops/{}.stop", job_id_for_stop);
+    let stop_flag_clone = Arc::clone(&stop_flag);
+    let job_state_clone = Arc::clone(&job_state);
     tokio::spawn(async move {
+        let mut stop_rx = stop_rx;
         loop {
-            for path in &stop_files {
-                if path.exists() {
-                    let _ = tx.send(()).await;
-                    return;
-                }
+            // Check for stop signal from channel
+            if let Ok(_) = stop_rx.try_recv() {
+                print(&format!("Received stop signal for job: {}", job_id_for_stop), false);
+                stop_flag_clone.store(true, Ordering::SeqCst);
+                *job_state_clone.lock().unwrap() = JobState::ShuttingDown;
+                break;
             }
+            
+            // Check for stop file
+            if tokio::fs::metadata(&stop_file_path).await.is_ok() {
+                print(&format!("Found stop file for job: {}", job_id_for_stop), false);
+                stop_flag_clone.store(true, Ordering::SeqCst);
+                *job_state_clone.lock().unwrap() = JobState::ShuttingDown;
+                // Clean up stop file
+                let _ = tokio::fs::remove_file(&stop_file_path).await;
+                break;
+            }
+            
+            // Sleep a bit before checking again
             sleep(Duration::from_millis(100)).await;
         }
     });
-
-    rx
-}
-
-pub fn create_stop_files() {
-    let stop_files = &[
-        ".stop-runner",
-        ".stop",
-        "data/.stop",
-    ];
-
-    for &path in stop_files {
-        if let Ok(mut file) = File::create(path) {
-            let _ = file.write_all(b"stop");
-        }
-    }
-
-    // Try temp directory
-    if let Some(tmp_dir) = std::env::temp_dir().to_str() {
-        let tmp_path = format!("{}/enidu.stop", tmp_dir);
-        if let Ok(mut file) = File::create(tmp_path) {
-            let _ = file.write_all(b"stop");
-        }
-    }
-}
-
-// Remove all stop files
-pub fn remove_stop_files() {
-    let stop_files = &[
-        ".stop-runner",
-        ".stop",
-        "data/.stop",
-    ];
-
-    for &path in stop_files {
-        let _ = std::fs::remove_file(path);
-    }
-
-    // Try temp directory
-    if let Some(tmp_dir) = std::env::temp_dir().to_str() {
-        let tmp_path = format!("{}/enidu.stop", tmp_dir);
-        let _ = std::fs::remove_file(tmp_path);
-    }
-}
-
-pub async fn handle_job(
-    app_state: Arc<AppState>,
-    job_info: JobInfo,
-) {
-    let id = job_info.id.clone();
-    let id_for_task = id.clone();
-
-    // Get broadcast channels from app state
-    let log_tx = {
-        let log_channels = app_state.log_channels.lock().unwrap();
-        log_channels.get(&id).cloned().unwrap()
-    };
-    let stop_tx = {
-        let stop_channels = app_state.stop_channels.lock().unwrap();
-        stop_channels.get(&id).cloned().unwrap()
-    };
-    let stop_rx = stop_tx.subscribe();
-
-    // Clone app_state for use after the async block
-    let app_state_clone = app_state.clone();
-
-    // Run the HTTP tester in a separate task
-    let handle = tokio::spawn(async move {
-        // Remove any existing stop files
-        remove_stop_files();
-
-        // Run the tester
-        let message = format!(
-            "Starting HTTP tester with URL: {}, Proxy: {:?}, Concurrency: {}, Timeout: {}s, Wait: {}ms, Random Headers: {}",
-            job_info.url,
-            job_info.proxy_addr,
-            job_info.concurrency,
-            job_info.timeout_sec,
-            job_info.wait_ms,
-            job_info.random_headers
-        );
-        print(&message, false);
-        let stats = http_tester(
-            job_info.url,
-            job_info.proxy_addr,
-            job_info.concurrency,
-            job_info.timeout_sec,
-            job_info.wait_ms,
-            job_info.random_headers,
-        ).await;
-
-        // Update job status when complete
-        let mut jobs = app_state.jobs.lock().unwrap();
-        if let Some(job) = jobs.get_mut(&id_for_task) {
-            job.status = JobStatus::Complete;
-        }
-
-        // Log completion
-        let final_stats_json = serde_json::json!({
-            "event": "job_complete",
-            "job_id": id_for_task,
-            "sent": stats.sent,
-            "success": stats.success,
-            "errors": stats.errors
-        });
-        let _ = log_tx.send(final_stats_json.to_string());
-
-        // Remove from job_tasks
-        {
-            let mut job_tasks = app_state.job_tasks.lock().unwrap();
-            job_tasks.remove(&id_for_task);
+    
+    // Spawn stats reporter task
+    let log_tx_clone = log_tx.clone();
+    let stats_clone = Arc::clone(&stats);
+    let job_state_clone = Arc::clone(&job_state);
+    // let job_id_clone = job_id.clone(); // already cloned above
+    tokio::spawn(async move {
+        let mut interval = time::interval(Duration::from_millis(STATS_UPDATE_INTERVAL_MS));
+        let mut last_requests = 0;
+        
+        loop {
+            interval.tick().await;
+            
+            // Calculate current RPS
+            let current_requests = stats_clone.requests.load(Ordering::Relaxed);
+            let requests_delta = current_requests.saturating_sub(last_requests);
+            let rps = (requests_delta as f64 / (STATS_UPDATE_INTERVAL_MS as f64 / 1000.0)) as u64;
+            stats_clone.update_rps(rps);
+            last_requests = current_requests;
+            
+            // Generate stats JSON and send to log channel
+            let stats_json = stats_clone.get_stats_json();
+            let state = {
+                let state = job_state_clone.lock().unwrap();
+                format!("{:?}", *state)
+            };
+            
+            let log_msg = format!(
+                "📊 [{}] State: {} | RPS: {}/s | Success: {} | Errors: {} | Avg Latency: {:.2}ms",
+                job_id_clone,
+                state,
+                rps,
+                stats_clone.successes.load(Ordering::Relaxed),
+                stats_clone.errors.load(Ordering::Relaxed),
+                *stats_clone.latency_ewma.lock().unwrap()
+            );
+            
+            let _ = log_tx_clone.send(log_msg);
+            
+            // Send detailed stats as JSON every second
+            if current_requests % 4 == 0 {  // Every ~1 second (250ms * 4)
+                let _ = log_tx_clone.send(format!("📈 STATS: {}", serde_json::to_string(&stats_json).unwrap()));
+            }
+            
+            // Break if job is stopped
+            if *job_state_clone.lock().unwrap() == JobState::Stopped {
+                break;
+            }
         }
     });
-
-    // Store the job task handle
-    {
-        let mut job_tasks = app_state_clone.job_tasks.lock().unwrap();
-        job_tasks.insert(id, handle);
+    
+    // Create HTTP client with optimal settings
+    let client = create_optimized_client(job.timeout_sec);
+    
+    // Create channel for work distribution
+    let (work_tx, _) = broadcast::channel(job.concurrency as usize * 2);
+    
+    // Spawn work generator
+    let urls = job.target_urls.clone();
+    let work_tx_clone = work_tx.clone();
+    let stop_flag_clone = Arc::clone(&stop_flag);
+    let job_state_clone = Arc::clone(&job_state);
+    let job_state_clone_for_signal = Arc::clone(&job_state);
+    tokio::spawn(async move {
+        // Use spawn_blocking to ensure RNG is thread-safe
+        tokio::task::spawn_blocking(move || {
+            let mut rng = rand::thread_rng();
+            
+            // Create Poisson distribution for realistic timing if wait_ms is set
+            let poisson_dist = if job.wait_ms > 0 {
+                Some(Poisson::new(job.wait_ms as f64).unwrap())
+            } else {
+                None
+            };
+            
+            loop {
+                // Stop generating work if shutdown requested
+                if stop_flag_clone.load(Ordering::SeqCst) || 
+                   *job_state_clone.lock().unwrap() != JobState::Running {
+                    break;
+                }
+                
+                // Select random URL from target list
+                let index = rng.gen_range(0..urls.len());
+                let url = urls[index].clone();
+                
+                // Send work item to all subscribers (workers)
+                if work_tx_clone.send(url).is_err() {
+                    break;
+                }
+                
+                // Wait based on specified delay or distribution
+                if let Some(dist) = &poisson_dist {
+                    let wait_time = dist.sample(&mut rng);
+                    sleep(Duration::from_millis(wait_time as u64));
+                } else if job.wait_ms > 0 {
+                    // Fixed wait with small jitter
+                    let jitter = if job.wait_ms > 10 {
+                        Uniform::new(0, job.wait_ms / 10).unwrap().sample(&mut rng)
+                    } else {
+                        0
+                    };
+                    sleep(Duration::from_millis((job.wait_ms + jitter) as u64));
+                }
+            }
+        }).await.unwrap();
+        
+        // Signal shutdown complete
+        *job_state_clone_for_signal.lock().unwrap() = JobState::Draining;
+    });
+    
+    // Spawn worker pool
+    let mut workers = Vec::with_capacity(job.concurrency as usize);
+    
+    for worker_id in 0..job.concurrency {
+        let mut work_rx = work_tx.subscribe();
+        let client_clone = client.clone();
+        let stats_clone = Arc::clone(&stats);
+        let stop_flag_clone = Arc::clone(&stop_flag);
+        let job_state_clone = Arc::clone(&job_state);
+        let concurrency_limit_clone = Arc::clone(&concurrency_limit);
+        let buffer_pool_clone = Arc::clone(&buffer_pool);
+        let log_tx_clone = log_tx.clone();
+        let random_headers = job.random_headers;
+        let method_str = job.method.clone();
+        let custom_body = job.custom_body.clone();
+        
+        let worker = tokio::spawn(async move {
+            // Parse HTTP method
+            let method = match method_str.as_str() {
+                "GET" => Method::GET,
+                "POST" => Method::POST,
+                "PUT" => Method::PUT,
+                "DELETE" => Method::DELETE,
+                "HEAD" => Method::HEAD,
+                _ => Method::GET,
+            };
+            
+            // Setup exponential backoff parameters
+            let mut backoff_ms: u64 = 10;
+            let max_backoff_ms: u64 = 1000;
+            
+            while !stop_flag_clone.load(Ordering::SeqCst) {
+                // Acquire semaphore permit to maintain concurrency limit
+                let permit = match concurrency_limit_clone.acquire().await {
+                    Ok(permit) => permit,
+                    Err(_) => break, // Semaphore closed, exit
+                };
+                
+                // Check if we should be draining instead of processing new work
+                let current_state = {
+                    let state = job_state_clone.lock().unwrap();
+                    (*state).clone()
+                };
+                
+                if current_state != JobState::Running {
+                    // Release permit and exit if not running
+                    drop(permit);
+                    break;
+                }
+                
+                // Get next URL to process
+                let url = match work_rx.recv().await {
+                    Ok(url) => url,
+                    Err(_) => break,
+                };
+                
+                // Get buffer from pool
+                let buffer = buffer_pool_clone.get_buffer();
+                
+                // Generate headers
+                let headers = generate_random_headers(random_headers);
+                
+                // Track timing
+                let request_start = Instant::now();
+                
+                // Build request with proper method and body
+                let mut req_builder = client_clone.request(method.clone(), &url)
+                    .headers(headers);
+                
+                // Add body for POST/PUT if specified
+                if (method == Method::POST || method == Method::PUT) && custom_body.is_some() {
+                    let body = custom_body.as_ref().unwrap();
+                    req_builder = req_builder.body(body.clone());
+                    stats_clone.bytes_sent.fetch_add(body.len() as u64, Ordering::Relaxed);
+                }
+                
+                // Track request count
+                stats_clone.requests.fetch_add(1, Ordering::Relaxed);
+                
+                // Execute request with retry logic
+                let mut retry_count = 0;
+                let mut _success = false;
+                
+                while retry_count <= MAX_RETRIES {
+                    match req_builder.try_clone().unwrap().send().await {
+                        Ok(response) => {
+                            // Track success
+                            stats_clone.successes.fetch_add(1, Ordering::Relaxed);
+                            
+                            // Try to read response body into buffer
+                            match response.bytes().await {
+                                Ok(bytes) => {
+                                    stats_clone.bytes_received.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                                },
+                                Err(_) => {
+                                    // Failed to read body, but request succeeded
+                                }
+                            }
+                            
+                            // Reset backoff on success
+                            backoff_ms = 10;
+                            _success = true;
+                            break;
+                        },
+                        Err(e) => {
+                            if e.is_timeout() {
+                                stats_clone.timeouts.fetch_add(1, Ordering::Relaxed);
+                            } else if e.is_connect() {
+                                stats_clone.conn_errors.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                stats_clone.errors.fetch_add(1, Ordering::Relaxed);
+                            }
+                            
+                            retry_count += 1;
+                            
+                            // Only retry if we haven't hit max retries and stop flag is not set
+                            if retry_count <= MAX_RETRIES && !stop_flag_clone.load(Ordering::SeqCst) {
+                                // Apply exponential backoff with jitter
+                                let jitter = rand::thread_rng().gen_range(0..=backoff_ms / 4);
+                                let sleep_ms = backoff_ms.saturating_add(jitter);
+                                
+                                if worker_id % 10 == 0 {  // Log only from some workers to reduce noise
+                                    let _ = log_tx_clone.send(format!(
+                                        "⚠️ Retry {} for request: {} ({}ms backoff) - Error: {}", 
+                                        retry_count, url, sleep_ms, e
+                                    ));
+                                }
+                                
+                                sleep(Duration::from_millis(sleep_ms)).await;
+                                
+                                // Exponential backoff with cap
+                                backoff_ms = (backoff_ms * 2).min(max_backoff_ms);
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                // Measure and record latency
+                let latency_ms = request_start.elapsed().as_millis() as u64;
+                stats_clone.update_latency(latency_ms);
+                
+                // Return buffer to pool
+                buffer_pool_clone.return_buffer(buffer);
+                
+                // Release concurrency permit
+                drop(permit);
+                
+                // Small yield to allow other tasks to run
+                if worker_id % 10 == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        
+        workers.push(worker);
     }
+    
+    // Wait for stop signal before waiting for workers
+    let log_tx_clone = log_tx.clone();
+    let job_state_clone = Arc::clone(&job_state);
+    
+    // Wait for all workers to complete
+    tokio::spawn(async move {
+        // Wait for job to enter draining state
+        loop {
+            let state = {
+                let state = job_state_clone.lock().unwrap();
+                (*state).clone()
+            };
+            
+            if state == JobState::Draining {
+                break;
+            }
+            
+            sleep(Duration::from_millis(100)).await;
+        }
+        
+        let _ = log_tx_clone.send("🔄 Job draining - waiting for workers to complete...".to_string());
+        
+        // Wait for all workers to complete
+        for (i, worker) in workers.into_iter().enumerate() {
+            if i % 100 == 0 || i == 0 || i + 1 == job.concurrency as usize {
+                let _ = log_tx_clone.send(format!("⏳ Waiting for worker {}/{} to complete", i + 1, job.concurrency));
+            }
+            let _ = worker.await;
+        }
+        
+        let _ = log_tx_clone.send("✅ All workers stopped, job complete".to_string());
+        
+        // Set job state to stopped
+        *job_state_clone.lock().unwrap() = JobState::Stopped;
+    });
+}
+
+// Create an optimized HTTP client
+fn create_optimized_client(timeout_sec: u64) -> Client {
+    let timeout = Duration::from_secs(timeout_sec);
+    
+    // Configure client with optimal settings for high-throughput benchmarking
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .pool_max_idle_per_host(HTTP_PIPELINE_DEPTH)
+        .pool_idle_timeout(Some(Duration::from_secs(30)))
+        .tcp_keepalive(Some(Duration::from_secs(30)))
+        .tcp_nodelay(true)  // Disable Nagle's algorithm for lower latency
+        .connect_timeout(Duration::from_secs(5))
+        .http2_keep_alive_interval(Some(Duration::from_secs(5)))
+        .http2_keep_alive_timeout(Duration::from_secs(10))
+        .http2_adaptive_window(true)
+        .build()
+        .unwrap()
 }
