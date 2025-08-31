@@ -5,7 +5,7 @@ for more performance and a significatlly smaller memory footprint.
 >Current version of Enidu is very heavy on go's concurrency model and tends to use 100x more memory. Thus development on a rust alternative is better. 
 
 >[!IMPORTANT]
->Use rand 0.8, if not the connect.rs will presist errors due to StdRng::from_entropy(); not been available in 0.9^
+> Current implementation has reduced RAM usage from 12GB to 3GB, which is a 75% decrease. Cpu is about a 35% decrease. 
 
 # Current layout
 
