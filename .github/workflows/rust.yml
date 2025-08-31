@@ -16,8 +16,6 @@ jobs:
             use-cross: true
           - target: aarch64-unknown-linux-musl
             use-cross: true
-          - target: x86_64-pc-windows-gnu
-            use-cross: false
 
     steps:
       - name: Checkout repository
