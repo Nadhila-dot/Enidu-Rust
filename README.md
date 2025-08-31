@@ -7,10 +7,13 @@ for more performance and a significatlly smaller memory footprint.
 >[!IMPORTANT]
 >Use rand 0.8, if not the connect.rs will presist errors due to StdRng::from_entropy(); not been available in 0.9^
 
+# Current layout
+
+Job -> Worker -> Connect
 
 Todos
 - Use tracing for logs
-- 
+
 
 
 Problems
