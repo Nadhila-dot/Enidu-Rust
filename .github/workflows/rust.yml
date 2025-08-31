@@ -34,17 +34,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pkg-config musl-tools
 
-      # For musl targets, use feature flags to avoid OpenSSL dependency
+      # For musl targets, build with RUSTFLAGS to statically link C libraries
       - name: Build musl targets
         if: matrix.use-cross
         run: |
-          # Use the rustls feature to avoid OpenSSL dependency
-          cargo build --release --target ${{ matrix.target }} --no-default-features --features rustls-tls
+          # Build with static linking for musl
+          cargo build --release --target ${{ matrix.target }}
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: true
           CARGO_TERM_COLOR: always
-          # Disable pkg-config for cross-compilation
-          PKG_CONFIG_ALLOW_CROSS: 0
+          # Force static linking of C libraries
+          RUSTFLAGS: "-C target-feature=+crt-static"
+          # Tell OpenSSL to compile in vendored mode
+          OPENSSL_STATIC: 1
+          OPENSSL_NO_VENDOR: 0
 
       # For Windows target, build normally
       - name: Build Windows target
