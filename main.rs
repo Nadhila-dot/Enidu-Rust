@@ -93,44 +93,44 @@ async fn async_main(
 ) {
     // In the async_main function, update the job listener:
 
-tokio::spawn(async move {
-    let mut job_rx = job_rx;
-    while let Some(job_info) = job_rx.recv().await {
-        let job_id = job_info.id.clone();
-        let state_clone_inner = Arc::clone(&state_clone);
+    tokio::spawn(async move {
+        let mut job_rx = job_rx;
+        while let Some(job_info) = job_rx.recv().await {
+            let job_id = job_info.id.clone();
+            let state_clone_inner = Arc::clone(&state_clone);
 
-        // Extract log_tx and stop_rx
-        let log_tx = {
-            let log_channels = state_clone_inner.log_channels.lock().unwrap();
-            match log_channels.get(&job_id) {
-                Some(tx) => tx.clone(),
-                None => {
-                    print(&format!("Error: No log channel for job: {}", job_id), true);
-                    continue;
+            // Extract log_tx and stop_rx
+            let log_tx = {
+                let log_channels = state_clone_inner.log_channels.lock().unwrap();
+                match log_channels.get(&job_id) {
+                    Some(tx) => tx.clone(),
+                    None => {
+                        print(&format!("Error: No log channel for job: {}", job_id), true);
+                        continue;
+                    }
                 }
-            }
-        };
-        
-        let stop_rx = {
-            let stop_channels = state_clone_inner.stop_channels.lock().unwrap();
-            match stop_channels.get(&job_id) {
-                Some(tx) => tx.subscribe(),
-                None => {
-                    print(&format!("Error: No stop channel for job: {}", job_id), true);
-                    continue;
+            };
+            
+            let stop_rx = {
+                let stop_channels = state_clone_inner.stop_channels.lock().unwrap();
+                match stop_channels.get(&job_id) {
+                    Some(tx) => tx.subscribe(),
+                    None => {
+                        print(&format!("Error: No stop channel for job: {}", job_id), true);
+                        continue;
+                    }
                 }
-            }
-        };
+            };
 
-        let handle = jobs_runtime_clone.spawn(async move {
-            crate::connect::handle_job(job_info, log_tx, stop_rx).await;
-        });
-        
-        // Store the handle in job_tasks
-        let mut job_tasks = state_clone.job_tasks.lock().unwrap();
-        job_tasks.insert(job_id, handle);
-    }
-});
+            let handle = jobs_runtime_clone.spawn(async move {
+                crate::connect::handle_job(job_info.clone(), state_clone_inner, log_tx, stop_rx, job_info.concurrency as usize).await;
+            });
+            
+            // Store the handle in job_tasks
+            let mut job_tasks = state_clone.job_tasks.lock().unwrap();
+            job_tasks.insert(job_id, handle);
+        }
+    });
 
     print(&format!("[SERVER] is running on http://localhost:{}", port), false);
     router::router::start_web_server(&port, state).await; // Pass state to webserver

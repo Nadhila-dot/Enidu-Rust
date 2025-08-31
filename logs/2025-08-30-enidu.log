@@ -1,5 +1,0 @@
-[13:25:54] [SERVER] Listening on port: 8085
-[13:25:54] [SERVER] is running on http://localhost:8085
-[13:26:04] Job created 171fd512-1c89-4f9b-8fd1-31ed89757a44
-[13:26:04] Starting HTTP tester with URL: https://hillwoodcollege.lk, Proxy: None, Concurrency: 10000, Timeout: 10s, Wait: 0ms, Random Headers: false
-[13:26:04] Listening for control messages

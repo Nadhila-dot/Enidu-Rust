@@ -2,7 +2,7 @@ mod connect;
 
 mod json;
 
-//mod http;
+mod http;
 
 pub use connect::{
     handle_job, 
