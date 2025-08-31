@@ -37,7 +37,24 @@ jobs:
             gcc-mingw-w64 \
             gcc-aarch64-linux-gnu \
             g++-aarch64-linux-gnu \
-            musl-tools
+            musl-tools \
+            musl-dev
+
+      # Set up environment for musl targets (to fix pkg-config cross-compilation)
+      - name: Configure for musl targets
+        if: contains(matrix.target, 'musl')
+        run: |
+          echo "Building Rust project for nadhi.dev...."
+          # Point pkg-config to musl's sysroot
+          export PKG_CONFIG_SYSROOT_DIR=/usr/x86_64-linux-musl
+          export PKG_CONFIG_PATH=/usr/x86_64-linux-musl/lib/pkgconfig:$PKG_CONFIG_PATH
+          # Vendor OpenSSL to avoid system dependency issues
+          export OPENSSL_STATIC=1
+          export OPENSSL_DIR=/usr
+          echo "PKG_CONFIG_SYSROOT_DIR=$PKG_CONFIG_SYSROOT_DIR" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH" >> $GITHUB_ENV
+          echo "OPENSSL_STATIC=1" >> $GITHUB_ENV
+          echo "OPENSSL_DIR=/usr" >> $GITHUB_ENV
 
       # Build the project
       - name: Build release
