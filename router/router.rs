@@ -103,17 +103,17 @@ async fn create_job(
     let id = Uuid::new_v4().to_string();
    let job = JobInfo {
         id: id.clone(),
-        url: payload.url.clone(),  // Assuming url is still used; adjust if target_urls replaces it
+        url: payload.url.clone(), 
         concurrency: payload.concurrency.unwrap_or(100),
         timeout_sec: payload.timeout_sec.unwrap_or(10),
         wait_ms: payload.wait_ms.unwrap_or(0),
         random_headers: payload.random_headers.unwrap_or(false),
         proxy_addr: payload.proxy_addr.clone(),
         status: JobStatus::Running,
-        target_urls: vec![payload.url.clone()],  // Default: single URL in a vector
-        custom_body: None,  // Default: no custom body
-        method: reqwest::Method::GET.to_string(),  // Default: GET method
-        disable_rate_limit: false,  // Default: rate limiting enabled
+        target_urls: vec![payload.url.clone()], 
+        custom_body: None,  
+        method: reqwest::Method::GET.to_string(),  
+        disable_rate_limit: false,  
     };
 
     // Increase capacities for high-throughput logs/stops
