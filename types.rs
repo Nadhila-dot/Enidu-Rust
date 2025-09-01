@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub enum JobStatus {
@@ -30,7 +30,7 @@ pub struct JobInfo {
 #[derive(Clone)] // Removed Default derive
 pub struct AppState {
     pub jobs: Arc<Mutex<HashMap<String, JobInfo>>>,
-    pub log_channels: Arc<Mutex<HashMap<String, broadcast::Sender<String>>>>,
+    pub log_channels: Arc<Mutex<HashMap<String, (mpsc::Sender<String>, mpsc::Receiver<String>)>>>,  // Store both sender and receiver
     pub stop_channels: Arc<Mutex<HashMap<String, broadcast::Sender<String>>>>,
     pub job_tasks: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     pub job_sender: tokio::sync::mpsc::Sender<JobInfo>,

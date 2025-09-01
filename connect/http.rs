@@ -17,6 +17,15 @@ use rustls::DigitallySignedStruct;
 use std::sync::Arc;
 use rand::prelude::*;  
 
+
+use crate::libs::logs::print;
+
+
+// Bloody imports for that http task thing
+use std::sync::Mutex;
+use tokio::task::JoinHandle;
+use once_cell::sync::Lazy;
+
 #[derive(Debug)]
 struct NoCertificateVerification;
 
@@ -67,7 +76,13 @@ impl ServerCertVerifier for NoCertificateVerification {
             rustls::SignatureScheme::ED448,
         ]
     }
+
+
 }
+
+
+
+pub static HTTP_TASK_HANDLES: Lazy<Mutex<Vec<JoinHandle<()>>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 // Add this function to read a single HTTP response from the stream
 async fn read_http_response<R: AsyncRead + Unpin>(
@@ -97,6 +112,8 @@ async fn read_http_response<R: AsyncRead + Unpin>(
     }
     Ok(())
 }
+
+
 
 pub fn hammer_http_max_load(
     host: &str,
@@ -187,7 +204,7 @@ pub fn hammer_http_max_load(
         let referers = referers.clone();
         let accept_languages = accept_languages.clone();
 
-        task::spawn(async move {
+        let handle = task::spawn(async move {
             if let Ok(mut addrs) = tokio::net::lookup_host((host_clone.as_str(), port)).await {
                 if let Some(addr) = addrs.next() {
                     let socket = match TcpSocket::new_v4() {
@@ -207,6 +224,7 @@ pub fn hammer_http_max_load(
                         Ok(s) => s,
                         Err(_) => {
                             eprintln!("Failed to connect to {}:{}", host_clone, port);
+                            print(&format!("Failed to connect to {}:{}", host_clone, port), true);
                             return;
                         }
                     };
@@ -217,14 +235,16 @@ pub fn hammer_http_max_load(
                         let domain = match ServerName::try_from(domain_owned) {
                             Ok(d) => d,
                             Err(_) => {
-                                eprintln!("Invalid domain: {}", domain_str);
+                               // eprintln!("Invalid domain: {}", domain_str);
+                                print(&format!("Invalid domain: {}", domain_str), true);
                                 return;
                             }
                         };
                         match connector.connect(domain, stream).await {
                             Ok(s) => Box::new(s),
                             Err(_) => {
-                                eprintln!("TLS connection failed for {}", domain_str);
+                              //  eprintln!("TLS connection failed for {}", domain_str);
+                                print(&format!("TLS connection failed for {}", domain_str), true);
                                 return;
                             }
                         }
@@ -271,9 +291,17 @@ pub fn hammer_http_max_load(
                 }
             }
         });
+        HTTP_TASK_HANDLES.lock().unwrap().push(handle);
     }
 }
 
+
+pub fn abort_all_http_tasks() {
+    let mut handles = HTTP_TASK_HANDLES.lock().unwrap();
+    for handle in handles.drain(..) {
+        handle.abort();
+    }
+}
 
 
 /*

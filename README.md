@@ -13,6 +13,7 @@ Job -> Worker -> Connect
 
 Todos
 - Use tracing for logs
+- Reduce CPU usage to have same punch for less power
 
 
 
@@ -25,3 +26,6 @@ Problems
 
 >[!NOTE]
 >Enidu is a part of Nadhi.dev, but all illegal actions done by enidu cannot be traced back to Nadhi.dev
+
+
+

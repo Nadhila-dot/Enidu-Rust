@@ -6,6 +6,7 @@ use axum::{
     Json, Router,
     http::StatusCode,
 };
+use futures::TryFutureExt;
 use serde::Deserialize;
 use serde_json::Value;
 use std::net::SocketAddr;
@@ -18,6 +19,9 @@ use futures_util::{StreamExt, SinkExt};
 
 use crate::env::container::get_system_stats;
 use crate::connect::{handle_job, stop_job as connector_stop_job, create_stop_files};
+use crate::connect::json::{daemon_json, daemon_modal};
+use crate::connect::broadcast::get_receiver;
+use crate::env::shutdown::stop_everything;
 
 #[derive(Deserialize)]
 struct WsControlMsg {
@@ -88,7 +92,7 @@ async fn index() -> impl IntoResponse {
 }
 
 async fn create_job(
-    State(state): State<crate::types::AppState>, // Use the passed state
+    State(state): State<crate::types::AppState>,
     Json(payload): Json<CreateJobRequest>,
 ) -> impl IntoResponse {
     if payload.url.is_empty() {
@@ -113,10 +117,10 @@ async fn create_job(
     };
 
     // Increase capacities for high-throughput logs/stops
-    let (log_tx, _) = broadcast::channel::<String>(10000); // Increased from 1000
-    let (stop_tx, _) = broadcast::channel::<String>(100); // Increased from 10
+    let (log_tx, log_rx) = mpsc::channel::<String>(10000);  // Use mpsc instead of broadcast
+    let (stop_tx, _) = broadcast::channel::<String>(100);  // Keep broadcast for stop (unchanged)
     state.jobs.lock().unwrap().insert(id.clone(), job.clone());
-    state.log_channels.lock().unwrap().insert(id.clone(), log_tx.clone());
+    state.log_channels.lock().unwrap().insert(id.clone(), (log_tx.clone(), log_rx));  // Store sender and receiver as tuple
     state.stop_channels.lock().unwrap().insert(id.clone(), stop_tx.clone());
 
     // Offload to jobs runtime via channel (no direct spawn)
@@ -169,7 +173,7 @@ async fn stop_job(
         let id_clone = id.clone();
         tokio::spawn(async move {
             tokio::task::spawn_blocking(move || {
-                connector_stop_job(&state_clone, &id_clone);
+                connector_stop_job(state_clone.into(), &id_clone);
             }).await.ok();
         });
 
@@ -190,7 +194,7 @@ async fn stop_all_jobs(State(state): State<AppState>) -> impl IntoResponse {
         let state_clone = state.clone();
         tokio::spawn(async move {
             tokio::task::spawn_blocking(move || {
-                connector_stop_job(&state_clone, &id);
+                connector_stop_job(state_clone.into(), &id);
             }).await.ok();
         });
     }
@@ -214,45 +218,42 @@ async fn ws_handler(
 
 // WebSocket handler implementation
 
-
 use tokio::sync::mpsc;
 
 async fn handle_socket(mut socket: axum::extract::ws::WebSocket, id: String, state: AppState) {
-    let log_rx = {
-        let log_channels = state.log_channels.lock().unwrap();
-        match log_channels.get(&id) {
-            Some(tx) => tx.subscribe(),
+    // Retrieve the receiver for this job from state.log_channels
+    let mut log_rx = {
+        let mut log_channels = state.log_channels.lock().unwrap();
+        match log_channels.remove(&id) {
+            Some((_tx, rx)) => rx, // Only keep the Receiver part
             None => return,
         }
     };
 
     let (mut sender, mut receiver) = socket.split();
-    let mut log_rx = log_rx;
 
     // Channel for control feedback messages
+    let mut broadcast_rx = get_receiver();
     let (feedback_tx, mut feedback_rx) = mpsc::unbounded_channel::<String>();
+    // Channel for event messages
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<(String, String)>(); // (event_type, data)
 
-    // Spawn a task to forward log and feedback messages to the client
+    // Spawn a task to forward log, feedback, and event messages to the client
     let send_task = tokio::spawn(async move {
         loop {
             tokio::select! {
-                Ok(msg) = log_rx.recv() => {
-                    let json_msg = serde_json::json!({
-                        "type": "log",
-                        "data": msg,
-                        "ts": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
-                    });
-                    if sender.send(Message::Text(json_msg.to_string().into())).await.is_err() {
+                Some(msg) = log_rx.recv() => {
+                    if sender.send(Message::Text(msg.into())).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(broadcast_msg) = broadcast_rx.recv() => {
+                    if sender.send(Message::Text(broadcast_msg.into())).await.is_err() {
                         break;
                     }
                 }
                 Some(feedback) = feedback_rx.recv() => {
-                    let json_msg = serde_json::json!({
-                        "type": "control",
-                        "data": feedback,
-                        "ts": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
-                    });
-                    if sender.send(Message::Text(json_msg.to_string().into())).await.is_err() {
+                    if sender.send(Message::Text(feedback.into())).await.is_err() {
                         break;
                     }
                 }
@@ -267,7 +268,16 @@ async fn handle_socket(mut socket: axum::extract::ws::WebSocket, id: String, sta
             if let Ok(cmd) = serde_json::from_str::<WsControlMsg>(&txt) {
                 if cmd.action == "stop" {
                     if cmd.target == "all" {
-                        print("Stopping all jobs signal received from websocket", false);
+                        print("Stopping all jobs signal received from websocket", true);
+                        // that daemon message
+                        crate::connect::create_stop_files(&state);
+                        let _ = feedback_tx.send(daemon_modal(
+                            "Rail-line Stopping...",
+                            "All jobs and workers have been forcefully stopped.",
+                            Some("https://nadhi.dev"),
+                            None,
+                        ));
+                        stop_everything(state.clone().into());
                         let job_ids: Vec<String> = {
                             let jobs = state.jobs.lock().unwrap();
                             jobs.keys().cloned().collect()
@@ -276,22 +286,45 @@ async fn handle_socket(mut socket: axum::extract::ws::WebSocket, id: String, sta
                             let state_clone = state.clone();
                             tokio::spawn(async move {
                                 tokio::task::spawn_blocking(move || {
-                                    connector_stop_job(&state_clone, &jid);
+                                   // connector_stop_job(state_clone.clone().into(), &jid);
+                                   // crate::connect::create_stop_files(&state_clone);
+                                   crate::env::shutdown::stop_everything(state_clone.clone().into());
                                 }).await.ok();
                             });
                         }
-                        // Send feedback via channel
-                        let _ = feedback_tx.send("🛑 Panic Stop activated for all jobs".into());
+                        
+                        // Werid ass message removed
+                     //   let _ = feedback_tx.send("🛑 Panic Stop activated for all jobs".into());
+                        let _ = feedback_tx.send(daemon_modal("Stopping Daemon", "Enidu instance is launching a stop sequence", Some("https://nadhi.dev"), None));
+                        stop_everything(state.clone().into());
+                        
+
+                        
+                        
                     } else {
-                        print(&format!("Stopping specific job signal received from websocket for job id: {}", cmd.target), false);
+                        print(&format!("Stopping specific job signal received from websocket for job id: {}", cmd.target), true);
                         let state_clone = state.clone();
                         let job_id = cmd.target.clone();
                         tokio::spawn(async move {
                             tokio::task::spawn_blocking(move || {
-                                connector_stop_job(&state_clone, &job_id);
+                                connector_stop_job(state_clone.into(), &job_id);
                             }).await.ok();
                         });
-                        let _ = feedback_tx.send(format!("🛑 Stop signal sent for job {}", cmd.target));
+                    //    let _ = feedback_tx.send(format!("🛑 Stop signal sent for job {}", cmd.target));
+                        let _ = feedback_tx.send(daemon_json("warn", &format!("Signaling job {} to stop..", cmd.target)));
+
+                       
+                        
+                    }
+                }
+                
+            }
+         
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&txt) {
+                if let Some(event) = val.get("event").and_then(|e| e.as_str()) {
+                    if let Some(data) = val.get("data").and_then(|d| d.as_str()) {
+                        // Forward any event sent by client to the event channel
+                        let _ = event_tx.send((event.to_string(), data.to_string()));
                     }
                 }
             }

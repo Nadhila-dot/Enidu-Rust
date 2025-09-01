@@ -14,6 +14,8 @@ use rustls::crypto::CryptoProvider;
 fn main() {
     let (num_threads, http_threads) = configure_threads();
 
+  
+
     rustls::crypto::ring::default_provider()
     .install_default()
     .unwrap();
@@ -29,6 +31,8 @@ fn main() {
     let port = env::checkport::get_container_port();
 
     print(&format!("[SERVER] Listening on port: {}", port), false);
+
+    
 
     // Create channel for job requests
     // We will listen to it
@@ -91,19 +95,17 @@ async fn async_main(
     state_clone: Arc<crate::types::AppState>,
     jobs_runtime_clone: Arc<tokio::runtime::Runtime>,
 ) {
-    // In the async_main function, update the job listener:
-
     tokio::spawn(async move {
         let mut job_rx = job_rx;
         while let Some(job_info) = job_rx.recv().await {
             let job_id = job_info.id.clone();
             let state_clone_inner = Arc::clone(&state_clone);
 
-            // Extract log_tx and stop_rx
+            // Extract log_tx (mpsc sender) from the tuple
             let log_tx = {
                 let log_channels = state_clone_inner.log_channels.lock().unwrap();
                 match log_channels.get(&job_id) {
-                    Some(tx) => tx.clone(),
+                    Some((tx, _)) => tx.clone(),  // Extract sender from tuple
                     None => {
                         print(&format!("Error: No log channel for job: {}", job_id), true);
                         continue;
@@ -133,5 +135,6 @@ async fn async_main(
     });
 
     print(&format!("[SERVER] is running on http://localhost:{}", port), false);
+      let _broadcast_sender = connect::broadcast::init(); // initialize broadcast sender
     router::router::start_web_server(&port, state).await; // Pass state to webserver
 }

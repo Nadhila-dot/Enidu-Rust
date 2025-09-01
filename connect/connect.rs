@@ -2,20 +2,24 @@ use crate::types::{AppState, JobInfo, JobStatus};
 use crate::libs::logs::print;
 use std::fs;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use reqwest::Url;
 use crate::connect::http::hammer_http_max_load;
 use tokio::task::JoinHandle;
+use crate::connect::json::{daemon_json, daemon_modal};
+
 
 pub async fn handle_job(
     job: JobInfo,
     state: Arc<AppState>,
-    log_tx: broadcast::Sender<String>,
+    log_tx: mpsc::Sender<String>, 
     mut stop_rx: broadcast::Receiver<String>,
     concurrency: usize,
 ) {
     print(&format!("Starting job {} with {} workers", job.id, concurrency), false);
-    let _ = log_tx.send(format!("Starting job {} with {} workers", job.id, concurrency));
+
+    //let _ = log_tx.send(daemon_modal(&format!("Created Job {}", job.id)));
+    let _ = log_tx.send(daemon_modal("New job Created!", &format!("A new Job with id {} created with {} workers", job.id, concurrency), Some("https://nadhi.dev"), None));
 
     // Parse URL to extract host, port, and TLS
     let url = Url::parse(&job.url).unwrap();
@@ -37,13 +41,14 @@ pub async fn handle_job(
         
         let handle = tokio::spawn(async move {
             print(&format!("Worker {} starting for job {}", worker_id, worker_job_id), false);
-            let _ = worker_log_tx.send(format!("Worker {} starting for job {}", worker_id, worker_job_id));
-            
-            // Call the hammering function for this worker
+            crate::connect::broadcast::send_update("update", &format!("Worker {} starting for job {}", worker_id, worker_job_id))
+                .unwrap_or_else(|_| 0);
+
+            // 🔨 
             hammer_http_max_load(
                 &worker_host, 
                 port, 
-                num_requests, // Each worker handles ALL requests
+                num_requests, // Each worker handles ALL requests (Very stressful)
                 drain_response, 
                 use_tls, 
                 true, 
@@ -51,7 +56,8 @@ pub async fn handle_job(
             );
             
             print(&format!("Worker {} completed for job {}", worker_id, worker_job_id), false);
-            let _ = worker_log_tx.send(format!("Worker {} completed for job {}", worker_id, worker_job_id));
+            crate::connect::broadcast::send_update("update", &format!("Worker {} completed for job {}", worker_id, worker_job_id))
+                .unwrap_or_else(|_| 0);
         });
         
         worker_handles.push(handle);
@@ -123,13 +129,21 @@ pub async fn handle_job(
     let _ = fs::remove_file(&stop_file);
 
     print(&format!("Job {} completed", job.id), false);
-    let _ = log_tx.send(format!("Job {} completed", job.id));
+    crate::connect::broadcast::send_update("update", &format!("Job {} completed", job.id))
+        .unwrap_or_else(|_| 0);
 }
 
-pub fn stop_job(state: &AppState, id: &str) {
+pub fn stop_job(state: Arc<AppState>, id: &str) {
     print(&format!("Stopping job {}", id), false);
 
+   
+
+    crate::connect::create_stop_files(&state);
+
+     crate::env::shutdown::stop_everything(state.clone());
+
     // Create stop file
+    print("MAKING STOP FILES DISK", true);
     let stop_file = format!("/tmp/enidu_stop_{}", id);
     fs::write(&stop_file, "stop").ok();
 
@@ -148,9 +162,14 @@ pub fn stop_job(state: &AppState, id: &str) {
 }
 
 pub fn create_stop_files(state: &AppState) {
+    print("[STOP FILES] Creating stop files for all jobs", true);
     let jobs = state.jobs.lock().unwrap();
     for id in jobs.keys() {
         let stop_file = format!("/tmp/enidu_stop_{}", id);
-        fs::write(&stop_file, "stop").ok();
+        // Spawn a tokio task to create the stop file asynchronously
+        let stop_file = stop_file.clone();
+        tokio::spawn(async move {
+            let _ = tokio::fs::write(&stop_file, "stop").await;
+        });
     }
 }

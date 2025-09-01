@@ -1,8 +1,10 @@
 mod connect;
 
-mod json;
+pub(crate) mod json;
 
-mod http;
+pub(crate) mod broadcast;
+
+pub(crate) mod http;
 
 pub use connect::{
     handle_job, 
